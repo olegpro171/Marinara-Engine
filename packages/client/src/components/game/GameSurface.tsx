@@ -54,6 +54,8 @@ import {
   useRecruitPartyMember,
   useRegenerateCharacterSheet,
   useRemovePartyMember,
+  useActiveCombatSession,
+  useCombatSessionHistory,
   gameKeys,
   patchChatMetadata,
 } from "../../hooks/use-game";
@@ -133,6 +135,8 @@ import type {
   CombatDialogueCue,
   CombatItemEffect,
   CombatMechanic,
+  CombatEncounterObjective,
+  CombatObjectiveState,
   DiceRollResult,
   EncounterInitResponse,
   EncounterSettings,
@@ -302,8 +306,7 @@ const GAME_MOBILE_ROOT_BUTTON = getChatToolbarButtonClass({
 const GAME_MOBILE_ICON_BUTTON = getChatToolbarButtonClass({ compact: true });
 const GAME_ACTION_MENU = cn(ROLEPLAY_POPOVER_SHELL, "flex w-72 max-w-[calc(100vw-2rem)] flex-col gap-1 p-1.5");
 const GAME_MOBILE_ACTIONS_MENU = cn(CHAT_TOOLBAR_OVERFLOW_MENU_CLASS, "absolute right-0 top-9");
-const GAME_MOBILE_CHOICE_STAGE_HEIGHT =
-  "max-h-[clamp(8rem,30svh,14rem)] sm:max-h-[clamp(9rem,36svh,20rem)]";
+const GAME_MOBILE_CHOICE_STAGE_HEIGHT = "max-h-[clamp(8rem,30svh,14rem)] sm:max-h-[clamp(9rem,36svh,20rem)]";
 const GAME_MOBILE_ACTION_MENU = cn(ROLEPLAY_POPOVER_SHELL, "flex w-72 max-w-[calc(100vw-4rem)] flex-col gap-1 p-1.5");
 const GAME_MOBILE_FLOATING_PANEL =
   "fixed z-[9999] h-[min(42rem,calc(100dvh-4.75rem))] w-[min(42rem,calc(100vw-4.75rem))]";
@@ -424,6 +427,7 @@ type PreparedCombatState = {
   party: Combatant[];
   enemies: Combatant[];
   itemEffects: CombatItemEffect[];
+  objectives: CombatObjectiveState[];
   mechanics: CombatMechanic[];
   dialogueCues: CombatDialogueCue[];
   /** Raw blueprint scene fields (tactical combat: palette + auto background). */
@@ -928,6 +932,7 @@ function generatedPartyMemberToCombatant(
   index: number,
   avatarCandidates: GamePartyMemberInfo[],
   fallbackLevel: number,
+  usedIds?: Set<string>,
 ): Combatant {
   const matchedAvatar = findNamedEntry(avatarCandidates, member.name, (entry) => entry.name);
   const maxHp = Math.max(1, Number(member.maxHp) || Number(member.hp) || 1);
@@ -935,8 +940,11 @@ function generatedPartyMemberToCombatant(
   const level = combatLevelFromHp(maxHp, fallbackLevel);
   const element = member.attacks?.find((attack) => attack.element)?.element;
   const combatClass = typeof member.class === "string" && member.class.trim() ? member.class.trim() : undefined;
+  const matchedId = matchedAvatar?.id && !usedIds?.has(matchedAvatar.id) ? matchedAvatar.id : undefined;
+  const id = matchedId ?? `generated-party-${index}-${slugifyCombatantId(member.name)}`;
+  usedIds?.add(id);
   return {
-    id: matchedAvatar?.id ?? `generated-party-${index}-${slugifyCombatantId(member.name)}`,
+    id,
     name: member.name || `Ally ${index + 1}`,
     hp,
     maxHp,
@@ -947,6 +955,7 @@ function generatedPartyMemberToCombatant(
     speed: 6 + level,
     level,
     side: "player",
+    isPlayer: member.isPlayer,
     sprite: matchedAvatar?.avatarUrl ?? undefined,
     statusEffects: combatStatusEffectsFromGenerated(member.statuses),
     skills: combatSkillsFromGeneratedAttacks(member.attacks, level),
@@ -993,6 +1002,38 @@ function generatedEnemyToCombatant(enemy: CombatEnemy, index: number, fallbackLe
     element,
     combatClass,
   };
+}
+
+function generatedCombatObjectives(
+  objectives: CombatEncounterObjective[] | undefined,
+  combatants: Combatant[],
+): CombatObjectiveState[] {
+  if (!Array.isArray(objectives)) return [];
+  const idsByName = new Map<string, string[]>();
+  for (const combatant of combatants) {
+    const key = normalizeTextForMatch(combatant.name);
+    if (!key) continue;
+    idsByName.set(key, [...(idsByName.get(key) ?? []), combatant.id]);
+  }
+  const enemyIds = combatants.filter((combatant) => combatant.side === "enemy").map((combatant) => combatant.id);
+  return objectives.slice(0, 20).map((objective, index) => {
+    const targetIds = objective.targetNames?.flatMap((name) => idsByName.get(normalizeTextForMatch(name)) ?? []);
+    const elimination = objective.kind === "eliminate" || objective.kind === "conditional_eliminate";
+    const fallbackToAllEnemies = elimination && (!targetIds || targetIds.length === 0);
+    return {
+      id: objective.id.trim() || `objective-${index + 1}`,
+      kind: objective.kind,
+      label: objective.label.trim(),
+      ...(fallbackToAllEnemies ? { targetIds: enemyIds, includeReinforcements: true } : targetIds ? { targetIds } : {}),
+      ...(objective.requiredProgress !== undefined
+        ? { requiredProgress: Math.max(1, objective.requiredProgress) }
+        : {}),
+      ...(objective.failAtRound !== undefined ? { failAtRound: Math.max(1, Math.floor(objective.failAtRound)) } : {}),
+      ...(objective.condition?.trim() ? { condition: objective.condition.trim() } : {}),
+      progress: 0,
+      status: "active" as const,
+    };
+  });
 }
 
 function cleanGameNpcDisplayName(value: string): string {
@@ -2081,7 +2122,9 @@ function GameVolumeMixer({
       style={style}
     >
       <div className="mb-2 flex items-center justify-between gap-3 border-b border-[var(--marinara-chat-chrome-panel-divider)] pb-2">
-        <span className="text-[0.6875rem] font-semibold uppercase text-[var(--marinara-chat-chrome-panel-muted)]">{localizeUi("game.toolbar.volume")}</span>
+        <span className="text-[0.6875rem] font-semibold uppercase text-[var(--marinara-chat-chrome-panel-muted)]">
+          {localizeUi("game.toolbar.volume")}
+        </span>
         <div className="flex items-center gap-1">
           <button
             type="button"
@@ -2092,12 +2135,21 @@ function GameVolumeMixer({
                 ? "bg-red-500/30 text-red-300 hover:bg-red-500/50"
                 : "bg-[var(--marinara-chat-chrome-button-bg)] text-[var(--marinara-chat-chrome-button-text)] ring-1 ring-[var(--marinara-chat-chrome-button-border)] hover:bg-[var(--marinara-chat-chrome-button-bg-hover)] hover:text-[var(--marinara-chat-chrome-button-text-hover)]",
             )}
-            title={audioMuted ?localizeUi("ui.game.gamevolumemixer.unmute") :localizeUi("ui.game.gamevolumemixer.mute")}
-            aria-label={audioMuted ?localizeUi("ui.game.gamevolumemixer.unmute") :localizeUi("ui.game.gamevolumemixer.mute")}
+            title={
+              audioMuted ? localizeUi("ui.game.gamevolumemixer.unmute") : localizeUi("ui.game.gamevolumemixer.mute")
+            }
+            aria-label={
+              audioMuted ? localizeUi("ui.game.gamevolumemixer.unmute") : localizeUi("ui.game.gamevolumemixer.mute")
+            }
           >
             {audioMuted ? <VolumeX size={12} /> : <Volume2 size={12} />}
           </button>
-          <button type="button" onClick={onClose} className={ROLEPLAY_POPOVER_CLOSE_BUTTON} aria-label={localizeUi("ui.game.gamevolumemixer.closeVolume")}>
+          <button
+            type="button"
+            onClick={onClose}
+            className={ROLEPLAY_POPOVER_CLOSE_BUTTON}
+            aria-label={localizeUi("ui.game.gamevolumemixer.closeVolume")}
+          >
             <X size={ROLEPLAY_POPOVER_CLOSE_ICON_SIZE} />
           </button>
         </div>
@@ -2355,9 +2407,7 @@ function GameSurfaceComponent({
   const { t: localizeUi } = useUiTranslation();
   const { t } = useTranslation();
   useRenderTimer("game-surface"); // [#3104 diagnostic]
-  const backgroundIllustration = useChatStore((state) =>
-    state.backgroundIllustrationChatIds.has(activeChatId),
-  );
+  const backgroundIllustration = useChatStore((state) => state.backgroundIllustrationChatIds.has(activeChatId));
   const agentsProcessing = useAgentStore((state) => state.processingChatIds.includes(activeChatId));
   const gameInputGenerationBlocked = isGenerationSendBlocked({
     streamActive: isStreaming,
@@ -2436,8 +2486,7 @@ function GameSurfaceComponent({
   const useJsonMusicDjGameMusic = useYoutubeGameMusic || useCustomGameMusic;
   const useMusicDjPlayerMusic = useSpotifyGameMusic || useJsonMusicDjGameMusic;
   const { data: ttsConfig } = useTTSConfig();
-  const generateGameSoundEffects =
-    ttsConfig?.source === "elevenlabs" && ttsConfig.elevenLabsGameSoundEffects === true;
+  const generateGameSoundEffects = ttsConfig?.source === "elevenlabs" && ttsConfig.elevenLabsGameSoundEffects === true;
   const generateGameMusic =
     ttsConfig?.source === "elevenlabs" && ttsConfig.elevenLabsGameMusic === true && !useMusicDjPlayerMusic;
   const activeGameMetaId = typeof chatMeta.gameId === "string" ? chatMeta.gameId : "";
@@ -2579,6 +2628,12 @@ function GameSurfaceComponent({
 
   // Asset store
   const queryClient = useQueryClient();
+  const activeChatIdRef = useRef(activeChatId);
+  const combatAftermathPendingRef = useRef(false);
+  useEffect(() => {
+    activeChatIdRef.current = activeChatId;
+    combatAftermathPendingRef.current = false;
+  }, [activeChatId]);
   const syncHudWidgetsToChatCache = useCallback(
     (widgets: HudWidget[]) => {
       const detailKey = chatKeys.detail(activeChatId);
@@ -2618,31 +2673,28 @@ function GameSurfaceComponent({
       ...generatedAudioAssetsRef.current,
     };
   }, [gameAssetExcludedFolders, queryClient]);
-  const generateGameAudioAsset = useCallback(
-    async (kind: "sfx" | "music", prompt: string): Promise<string | null> => {
-      const category = kind === "sfx" ? "sfx" : "music";
-      if (prompt.startsWith(`${category}:generated:`)) return prompt;
-      try {
-        const generated = await withTimeout(
-          (signal) => api.post<{ tag: string; path: string }>("/tts/game-audio", { kind, prompt }, { signal }),
-          GAME_AUDIO_GENERATION_TIMEOUT_MS,
-        );
-        generatedAudioAssetsRef.current[generated.tag] = {
-          tag: generated.tag,
-          category,
-          subcategory: "generated",
-          name: generated.tag.split(":").at(-1) ?? generated.tag,
-          path: generated.path,
-          ext: ".mp3",
-        };
-        return generated.tag;
-      } catch (error) {
-        console.warn(`[game-audio] Failed to generate ${kind}:`, error);
-        return null;
-      }
-    },
-    [],
-  );
+  const generateGameAudioAsset = useCallback(async (kind: "sfx" | "music", prompt: string): Promise<string | null> => {
+    const category = kind === "sfx" ? "sfx" : "music";
+    if (prompt.startsWith(`${category}:generated:`)) return prompt;
+    try {
+      const generated = await withTimeout(
+        (signal) => api.post<{ tag: string; path: string }>("/tts/game-audio", { kind, prompt }, { signal }),
+        GAME_AUDIO_GENERATION_TIMEOUT_MS,
+      );
+      generatedAudioAssetsRef.current[generated.tag] = {
+        tag: generated.tag,
+        category,
+        subcategory: "generated",
+        name: generated.tag.split(":").at(-1) ?? generated.tag,
+        path: generated.path,
+        ext: ".mp3",
+      };
+      return generated.tag;
+    } catch (error) {
+      console.warn(`[game-audio] Failed to generate ${kind}:`, error);
+      return null;
+    }
+  }, []);
   const materializeGeneratedGameAudio = useCallback(
     async (input: SceneAnalysis): Promise<SceneAnalysis> => {
       if (!generateGameSoundEffects && !generateGameMusic) return input;
@@ -2664,9 +2716,7 @@ function GameSurfaceComponent({
               next.music = (await generateGameAudioAsset("music", next.music)) ?? undefined;
             }
             if (generateGameSoundEffects && next.sfx?.length) {
-              const generated = await Promise.all(
-                next.sfx.map((prompt) => generateGameAudioAsset("sfx", prompt)),
-              );
+              const generated = await Promise.all(next.sfx.map((prompt) => generateGameAudioAsset("sfx", prompt)));
               next.sfx = generated.filter((tag): tag is string => !!tag);
             }
             return next;
@@ -2694,6 +2744,7 @@ function GameSurfaceComponent({
   const [mobileVolumePopoverAnchor, setMobileVolumePopoverAnchor] = useState<ChatToolbarFloatingPanelAnchor>(null);
   const [mobileGameAssetsPanelAnchor, setMobileGameAssetsPanelAnchor] = useState<ChatToolbarFloatingPanelAnchor>(null);
   const [combatLogsOpen, setCombatLogsOpen] = useState(false);
+  const combatSessionHistory = useCombatSessionHistory(activeChatId, combatLogsOpen && gameState === "combat");
   const closeCombatLogs = useCallback(() => setCombatLogsOpen(false), []);
   const combatLogsBackdropDismiss = useBackdropDismiss(closeCombatLogs);
   const [spotifyRetryPending, setSpotifyRetryPending] = useState(false);
@@ -2774,6 +2825,7 @@ function GameSurfaceComponent({
   const [combatGenerationPending, setCombatGenerationPending] = useState(false);
   const [combatGenerationError, setCombatGenerationError] = useState<string | null>(null);
   const [combatItemEffects, setCombatItemEffects] = useState<CombatItemEffect[]>([]);
+  const [combatObjectives, setCombatObjectives] = useState<CombatObjectiveState[]>([]);
   const [combatMechanics, setCombatMechanics] = useState<CombatMechanic[]>([]);
   const [combatDialogueCues, setCombatDialogueCues] = useState<CombatDialogueCue[]>([]);
   // Scene fields captured from the /encounter/init blueprint. Threaded into the
@@ -2898,6 +2950,7 @@ function GameSurfaceComponent({
       resolve?.(null);
     }
     setCombatItemEffects([]);
+    setCombatObjectives([]);
     setCombatMechanics([]);
     setCombatDialogueCues([]);
   }, [activeChatId]);
@@ -3153,6 +3206,7 @@ function GameSurfaceComponent({
     setQueuedCombatGeneration(null);
     setCombatGenerationPending(false);
     setCombatItemEffects([]);
+    setCombatObjectives([]);
     setCombatMechanics([]);
     setCombatDialogueCues([]);
     setPendingEncounter(null);
@@ -3902,17 +3956,23 @@ function GameSurfaceComponent({
       event.currentTarget.releasePointerCapture(event.pointerId);
   }, []);
 
-  const combatLogEntries = useMemo(
-    () =>
-      messages
-        .map((message) => ({
-          id: message.id,
-          role: message.role,
-          content: formatCombatLogContent(message),
-        }))
-        .filter((entry) => entry.content.length > 0),
-    [messages],
-  );
+  const combatLogEntries = useMemo(() => {
+    const messageEntries = messages
+      .map((message) => ({
+        id: message.id,
+        role: message.role,
+        content: formatCombatLogContent(message),
+      }))
+      .filter((entry) => entry.content.length > 0);
+    const actionEntries = (combatSessionHistory.data?.history ?? []).flatMap((record) =>
+      record.response.events.map((event) => ({
+        id: `combat:${record.actionId}:${event.eventId}`,
+        role: "system" as const,
+        content: `[R${record.revision}] ${event.text}`,
+      })),
+    );
+    return [...messageEntries, ...actionEntries];
+  }, [combatSessionHistory.data?.history, messages]);
   const combatLogPageSize = Math.max(1, messagesPerPage > 0 ? messagesPerPage : combatLogEntries.length || 20);
   const [combatLogVisibleCount, setCombatLogVisibleCount] = useState(combatLogPageSize);
   useEffect(() => {
@@ -4140,7 +4200,9 @@ function GameSurfaceComponent({
         await queryClient.invalidateQueries({ queryKey: ["spotify", "player"] });
       } catch (error) {
         console.warn("[spotify/game] Failed to play scene track:", error);
-        toast.error(error instanceof Error ? error.message :localizeUi("ui.game.gamesurfacecomponent.spotifySceneMusicFailed"));
+        toast.error(
+          error instanceof Error ? error.message : localizeUi("ui.game.gamesurfacecomponent.spotifySceneMusicFailed"),
+        );
       } finally {
         setSpotifyRetryPending(false);
       }
@@ -4405,7 +4467,9 @@ function GameSurfaceComponent({
     }
     setCombatParty(rawParty);
     setCombatEnemies(rawEnemies);
+    if (Array.isArray(snapshot.inventory)) setInventoryItems(snapshot.inventory);
     setCombatItemEffects(Array.isArray(snapshot.itemEffects) ? snapshot.itemEffects : []);
+    setCombatObjectives(Array.isArray(snapshot.objectives) ? snapshot.objectives : []);
     setCombatMechanics(Array.isArray(snapshot.mechanics) ? snapshot.mechanics : []);
     setCombatDialogueCues(Array.isArray(snapshot.dialogueCues) ? snapshot.dialogueCues : []);
     if (snapshot.startMessageId) setCombatStartMessageId(snapshot.startMessageId);
@@ -4424,14 +4488,17 @@ function GameSurfaceComponent({
   // Shared helper used by combat-end + return-to-pre-combat-turn so both paths reliably
   // wipe the persisted snapshot, even if the exploration-state PATCH is still in flight
   // when the user refreshes.
-  const clearCombatSnapshot = useCallback((chatId: string | null) => {
+  const clearCombatSnapshot = useCallback(async (chatId: string | null) => {
     if (!chatId) return;
     if (combatPersistTimer.current) {
       clearTimeout(combatPersistTimer.current);
       combatPersistTimer.current = null;
     }
     combatPendingSnapshotRef.current = null;
-    api.patch(`/chats/${chatId}/metadata`, { gameCombatState: null }).catch(() => {});
+    await api.patch(`/chats/${chatId}/metadata`, {
+      gameCombatState: null,
+      gameTacticalCombatSnapshot: null,
+    });
   }, []);
   useEffect(() => {
     if (combatRestoredChatIdRef.current !== activeChatId) return;
@@ -4440,7 +4507,9 @@ function GameSurfaceComponent({
     const snapshot: GameCombatStateSnapshot = {
       party: combatParty,
       enemies: combatEnemies,
+      inventory: inventoryItems,
       itemEffects: combatItemEffects,
+      objectives: combatObjectives,
       mechanics: combatMechanics,
       dialogueCues: combatDialogueCues,
       startMessageId: combatStartMessageId,
@@ -4479,7 +4548,9 @@ function GameSurfaceComponent({
     activeChatId,
     combatParty,
     combatEnemies,
+    inventoryItems,
     combatItemEffects,
+    combatObjectives,
     combatMechanics,
     combatDialogueCues,
     combatStartMessageId,
@@ -4687,6 +4758,7 @@ function GameSurfaceComponent({
     setPreparedCombatState(null);
     setCombatGenerationError(null);
     setCombatItemEffects([]);
+    setCombatObjectives([]);
     setCombatMechanics([]);
     setCombatDialogueCues([]);
     setPendingSegmentEffects([]);
@@ -5207,11 +5279,12 @@ function GameSurfaceComponent({
         let preview: GameAssetGenerationPreview | undefined;
         try {
           preview = await withTimeout(
-            (signal) =>
-              api.post<GameAssetGenerationPreview>("/game/generate-assets/preview", payload, { signal }),
+            (signal) => api.post<GameAssetGenerationPreview>("/game/generate-assets/preview", payload, { signal }),
             GAME_ASSET_PREVIEW_TIMEOUT_MS,
             () => {
-              toast.error(localizeUi("ui.game.gamesurfacecomponent.imagePromptPreviewTimedOutContinuingWithTheDefault"));
+              toast.error(
+                localizeUi("ui.game.gamesurfacecomponent.imagePromptPreviewTimedOutContinuingWithTheDefault"),
+              );
             },
           );
         } catch (error) {
@@ -5239,7 +5312,9 @@ function GameSurfaceComponent({
               GAME_ASSET_PROMPT_REVIEW_TIMEOUT_MS,
               () => {
                 closeImagePromptReview(null);
-                toast.error(localizeUi("ui.game.gamesurfacecomponent.imagePromptReviewTimedOutContinuingWithTheDefault"));
+                toast.error(
+                  localizeUi("ui.game.gamesurfacecomponent.imagePromptReviewTimedOutContinuingWithTheDefault"),
+                );
               },
             );
           } catch (error) {
@@ -5271,7 +5346,8 @@ function GameSurfaceComponent({
       gameImageIncludeCharacterAppearance,
       gameImageUseAvatarReferences,
       gameStoryboardBackgroundVisualEnabled,
-      openImagePromptReview, localizeUi,
+      openImagePromptReview,
+      localizeUi,
     ],
   );
 
@@ -5293,10 +5369,7 @@ function GameSurfaceComponent({
     [clearFailedNpcAvatars, fetchManifest, installGeneratedIllustration],
   );
 
-  async function applySceneResult(
-    incomingResult: SceneAnalysis,
-    msg: { id: string; content?: string | null },
-  ) {
+  async function applySceneResult(incomingResult: SceneAnalysis, msg: { id: string; content?: string | null }) {
     const result = await materializeGeneratedGameAudio(incomingResult);
     setSceneAnalysisFailed(false);
     // NOTE: Game state transitions are owned exclusively by the GM model via [state: ...] tags.
@@ -5628,7 +5701,9 @@ function GameSurfaceComponent({
   const handleManualSceneBackground = useCallback(async () => {
     if (!activeChatId || manualBackgroundGenerating) return;
     if (gameStoryboardBackgroundVisualEnabled) {
-      toast.error(localizeUi("ui.game.gamesurfacecomponent.sceneBackgroundGenerationIsDisabledWhileStoryboardVisualsAre"));
+      toast.error(
+        localizeUi("ui.game.gamesurfacecomponent.sceneBackgroundGenerationIsDisabledWhileStoryboardVisualsAre"),
+      );
       return;
     }
     if (!gameBackgroundGenerationEnabled) {
@@ -5683,7 +5758,9 @@ function GameSurfaceComponent({
       toast.success(localizeUi("ui.game.gamesurfacecomponent.backgroundGenerated"), { duration: 1800 });
     } catch (error) {
       setAssetGenerationFailed(true);
-      toast.error(error instanceof Error ? error.message :localizeUi("ui.game.gamesurfacecomponent.backgroundGenerationFailed"));
+      toast.error(
+        error instanceof Error ? error.message : localizeUi("ui.game.gamesurfacecomponent.backgroundGenerationFailed"),
+      );
     } finally {
       setManualBackgroundGenerating(false);
       setAssetGenerationBlocksScene(false);
@@ -5701,7 +5778,8 @@ function GameSurfaceComponent({
     gameSnapshot?.weather,
     manualBackgroundGenerating,
     metaTime,
-    runGameAssetGeneration, localizeUi,
+    runGameAssetGeneration,
+    localizeUi,
   ]);
 
   const handleManualSceneIllustration = useCallback(async () => {
@@ -5776,7 +5854,9 @@ function GameSurfaceComponent({
       }
     } catch (error) {
       setAssetGenerationFailed(true);
-      toast.error(error instanceof Error ? error.message :localizeUi("ui.game.gamesurfacecomponent.sceneIllustrationFailed"));
+      toast.error(
+        error instanceof Error ? error.message : localizeUi("ui.game.gamesurfacecomponent.sceneIllustrationFailed"),
+      );
     } finally {
       setAssetGenerationBlocksScene(false);
     }
@@ -5793,7 +5873,8 @@ function GameSurfaceComponent({
     metaTime,
     npcs,
     runGameAssetGeneration,
-    sceneWrapCharacterNames, localizeUi,
+    sceneWrapCharacterNames,
+    localizeUi,
   ]);
 
   const handleGenerateSceneVideo = useCallback(
@@ -5832,7 +5913,9 @@ function GameSurfaceComponent({
                 ),
               GAME_ASSET_PREVIEW_TIMEOUT_MS,
               () => {
-                toast.error(localizeUi("ui.game.gamesurfacecomponent.videoPromptPreviewTimedOutContinuingWithTheDefault"));
+                toast.error(
+                  localizeUi("ui.game.gamesurfacecomponent.videoPromptPreviewTimedOutContinuingWithTheDefault"),
+                );
               },
             );
           } catch (error) {
@@ -5862,7 +5945,9 @@ function GameSurfaceComponent({
                 GAME_ASSET_PROMPT_REVIEW_TIMEOUT_MS,
                 () => {
                   closeImagePromptReview(null);
-                  toast.error(localizeUi("ui.game.gamesurfacecomponent.videoPromptReviewTimedOutContinuingWithTheDefault"));
+                  toast.error(
+                    localizeUi("ui.game.gamesurfacecomponent.videoPromptReviewTimedOutContinuingWithTheDefault"),
+                  );
                 },
               );
             } catch (error) {
@@ -5895,7 +5980,11 @@ function GameSurfaceComponent({
         toast.success(localizeUi("ui.game.gamesurfacecomponent.sceneVideoGenerated"), { duration: 1800 });
       } catch (error) {
         setSceneVideoFailed(true);
-        toast.error(error instanceof Error ? error.message :localizeUi("ui.game.gamesurfacecomponent.sceneVideoGenerationFailed"));
+        toast.error(
+          error instanceof Error
+            ? error.message
+            : localizeUi("ui.game.gamesurfacecomponent.sceneVideoGenerationFailed"),
+        );
       } finally {
         setImagePromptReviewSubmitting(false);
         setSceneVideoGenerating(false);
@@ -5909,7 +5998,8 @@ function GameSurfaceComponent({
       openImagePromptReview,
       queryClient,
       sceneVideoGenerating,
-      sceneVideosQuery, localizeUi,
+      sceneVideosQuery,
+      localizeUi,
     ],
   );
 
@@ -5981,7 +6071,9 @@ function GameSurfaceComponent({
             () => previewTurnStoryboardPrompts.mutateAsync(payload),
             GAME_ASSET_PREVIEW_TIMEOUT_MS,
             () => {
-              toast.error(localizeUi("ui.game.gamesurfacecomponent.storyboardPromptPreviewTimedOutContinuingWithTheDefault"));
+              toast.error(
+                localizeUi("ui.game.gamesurfacecomponent.storyboardPromptPreviewTimedOutContinuingWithTheDefault"),
+              );
             },
           );
         } catch (error) {
@@ -5998,7 +6090,9 @@ function GameSurfaceComponent({
                 GAME_ASSET_PROMPT_REVIEW_TIMEOUT_MS,
                 () => {
                   closeImagePromptReview(null);
-                  toast.error(localizeUi("ui.game.gamesurfacecomponent.storyboardPromptReviewTimedOutContinuingWithTheDefault"));
+                  toast.error(
+                    localizeUi("ui.game.gamesurfacecomponent.storyboardPromptReviewTimedOutContinuingWithTheDefault"),
+                  );
                 },
               );
             } catch (error) {
@@ -6024,14 +6118,20 @@ function GameSurfaceComponent({
       const frameCount = result.storyboard.keyframes.length;
       toast.success(
         isGameTurnStoryboardRendering(result.storyboard)
-          ?localizeUi("ui.game.gamesurfacecomponent.storyboardPlannedWithValue1KeyframesImagesAreRendering", { value1: frameCount })
+          ? localizeUi("ui.game.gamesurfacecomponent.storyboardPlannedWithValue1KeyframesImagesAreRendering", {
+              value1: frameCount,
+            })
           : result.storyboard.status === "partial"
-            ?localizeUi("ui.game.gamesurfacecomponent.storyboardSavedWithValue1KeyframesSomeMediaFailed", { value1: frameCount })
-            :localizeUi("ui.game.gamesurfacecomponent.storyboardSavedWithValue1Keyframes", { value1: frameCount }),
+            ? localizeUi("ui.game.gamesurfacecomponent.storyboardSavedWithValue1KeyframesSomeMediaFailed", {
+                value1: frameCount,
+              })
+            : localizeUi("ui.game.gamesurfacecomponent.storyboardSavedWithValue1Keyframes", { value1: frameCount }),
         { duration: 2200 },
       );
     } catch (error) {
-      toast.error(error instanceof Error ? error.message :localizeUi("ui.game.gamesurfacecomponent.storyboardGenerationFailed"));
+      toast.error(
+        error instanceof Error ? error.message : localizeUi("ui.game.gamesurfacecomponent.storyboardGenerationFailed"),
+      );
     } finally {
       setManualStoryboardReviewActive(false);
     }
@@ -6053,7 +6153,8 @@ function GameSurfaceComponent({
     openImagePromptReview,
     previewTurnStoryboardPrompts,
     applyGeneratedStoryboardToCache,
-    storyboardGenerating, localizeUi,
+    storyboardGenerating,
+    localizeUi,
   ]);
 
   useEffect(() => {
@@ -6310,6 +6411,7 @@ function GameSurfaceComponent({
     setQueuedCombatGeneration(null);
     setCombatGenerationPending(false);
     setCombatItemEffects([]);
+    setCombatObjectives([]);
     setCombatMechanics([]);
     setCombatDialogueCues([]);
     setActiveReadable(null);
@@ -6351,8 +6453,8 @@ function GameSurfaceComponent({
       await retryAgents(activeChatId, ["spotify"]);
       toast.success(
         musicPlayerSource === "custom"
-          ?localizeUi("ui.game.gamesurfacecomponent.musicDjPickingAFreshLocalTrack")
-          :localizeUi("ui.game.gamesurfacecomponent.musicDjPickingAFreshYoutubeTrack"),
+          ? localizeUi("ui.game.gamesurfacecomponent.musicDjPickingAFreshLocalTrack")
+          : localizeUi("ui.game.gamesurfacecomponent.musicDjPickingAFreshYoutubeTrack"),
         { duration: 1800 },
       );
     } catch (error) {
@@ -6361,7 +6463,15 @@ function GameSurfaceComponent({
     } finally {
       setYoutubeRetryPending(false);
     }
-  }, [activeChatId, isStreaming, musicPlayerSource, retryAgents, sceneAnalysis.isPending, useJsonMusicDjGameMusic, localizeUi]);
+  }, [
+    activeChatId,
+    isStreaming,
+    musicPlayerSource,
+    retryAgents,
+    sceneAnalysis.isPending,
+    useJsonMusicDjGameMusic,
+    localizeUi,
+  ]);
 
   const handleRetrySpotifyMusic = useCallback(async () => {
     if (!activeChatId || !useSpotifyGameMusic || isStreaming || sceneAnalysis.isPending) return;
@@ -6483,7 +6593,8 @@ function GameSurfaceComponent({
     sceneWrapCharacterNames,
     sidecarConfig.useForGameScene,
     sidecarReady,
-    useSpotifyGameMusic, localizeUi,
+    useSpotifyGameMusic,
+    localizeUi,
   ]);
 
   const sendMessage = useCallback(
@@ -6578,8 +6689,10 @@ function GameSurfaceComponent({
         useGameModeStore.getState().setSetupActive(false);
         toast.error(
           error instanceof Error
-            ?localizeUi("ui.game.gamesurfacecomponent.theGameWasCreatedButItsMapDraftFailed_7b65e53", { value1: error.message })
-            :localizeUi("ui.game.gamesurfacecomponent.theGameWasCreatedButItsMapDraftFailed"),
+            ? localizeUi("ui.game.gamesurfacecomponent.theGameWasCreatedButItsMapDraftFailed_7b65e53", {
+                value1: error.message,
+              })
+            : localizeUi("ui.game.gamesurfacecomponent.theGameWasCreatedButItsMapDraftFailed"),
           { duration: 10000 },
         );
       }
@@ -6607,7 +6720,9 @@ function GameSurfaceComponent({
         onError: (err) => {
           startGameGuardRef.current = false;
           setStartGameRequested(false);
-          toast.error(err instanceof Error ? err.message :localizeUi("ui.game.gamesurfacecomponent.failedToStartGame"));
+          toast.error(
+            err instanceof Error ? err.message : localizeUi("ui.game.gamesurfacecomponent.failedToStartGame"),
+          );
           console.error("[GameSurface] startGame failed:", err);
         },
       },
@@ -6649,7 +6764,9 @@ function GameSurfaceComponent({
         api.patch(`/chats/${activeChatId}/game-state`, { time: formattedTime }).catch(() => {});
         toast.success(localizeUi("ui.game.gamesurfacecomponent.setGameDayToValue1", { value1: nextTime.day }));
       } catch (error) {
-        toast.error(error instanceof Error ? error.message :localizeUi("ui.game.gamesurfacecomponent.failedToUpdateGameDay"));
+        toast.error(
+          error instanceof Error ? error.message : localizeUi("ui.game.gamesurfacecomponent.failedToUpdateGameDay"),
+        );
       }
     },
     [activeChatId, gameTimeMeta?.hour, gameTimeMeta?.minute, updateChatMetadata, localizeUi],
@@ -6697,9 +6814,15 @@ function GameSurfaceComponent({
           });
         }
         api.patch(`/chats/${activeChatId}/game-state`, { time: formattedTime }).catch(() => {});
-        toast.success(localizeUi("ui.game.gamesurfacecomponent.setGameTimeToValue1", { value1: getGameTimeOfDayLabel(nextTime.hour) }));
+        toast.success(
+          localizeUi("ui.game.gamesurfacecomponent.setGameTimeToValue1", {
+            value1: getGameTimeOfDayLabel(nextTime.hour),
+          }),
+        );
       } catch (error) {
-        toast.error(error instanceof Error ? error.message :localizeUi("ui.game.gamesurfacecomponent.failedToUpdateGameTime"));
+        toast.error(
+          error instanceof Error ? error.message : localizeUi("ui.game.gamesurfacecomponent.failedToUpdateGameTime"),
+        );
       }
     },
     [activeChatId, currentGameDay, metaWeather, updateChatMetadata, localizeUi],
@@ -6815,7 +6938,11 @@ function GameSurfaceComponent({
         clearFailedNpcAvatars([targetNpc.name]);
         toast.success(localizeUi("ui.game.gamesurfacecomponent.value1PortraitUpdated", { value1: targetNpc.name }));
       } catch (error) {
-        toast.error(error instanceof Error ? error.message :localizeUi("ui.game.gamesurfacecomponent.failedToUpdateValue1Portrait", { value1: npcName }));
+        toast.error(
+          error instanceof Error
+            ? error.message
+            : localizeUi("ui.game.gamesurfacecomponent.failedToUpdateValue1Portrait", { value1: npcName }),
+        );
       }
     },
     [activeChatId, clearFailedNpcAvatars, updateChatMetadata, localizeUi],
@@ -6881,10 +7008,16 @@ function GameSurfaceComponent({
           clearFailedNpcAvatars([targetNpc.name]);
           toast.success(localizeUi("ui.game.gamesurfacecomponent.value1PortraitGenerated", { value1: targetNpc.name }));
         } else {
-          toast.error(localizeUi("ui.game.gamesurfacecomponent.noPortraitWasGeneratedForValue1", { value1: targetNpc.name }));
+          toast.error(
+            localizeUi("ui.game.gamesurfacecomponent.noPortraitWasGeneratedForValue1", { value1: targetNpc.name }),
+          );
         }
       } catch (error) {
-        toast.error(error instanceof Error ? error.message :localizeUi("ui.game.gamesurfacecomponent.failedToGenerateValue1Portrait", { value1: displayName }));
+        toast.error(
+          error instanceof Error
+            ? error.message
+            : localizeUi("ui.game.gamesurfacecomponent.failedToGenerateValue1Portrait", { value1: displayName }),
+        );
       } finally {
         setGeneratingNpcPortraitNames((current) => {
           const next = new Set(current);
@@ -6900,7 +7033,8 @@ function GameSurfaceComponent({
       chatMeta.gameImageConnectionId,
       chatMeta.gameNpcs,
       clearFailedNpcAvatars,
-      runGameAssetGeneration, localizeUi,
+      runGameAssetGeneration,
+      localizeUi,
     ],
   );
 
@@ -6922,9 +7056,17 @@ function GameSurfaceComponent({
           gameJournal: prunedJournal,
         });
         useGameModeStore.getState().setNpcs(nextNpcs);
-        toast.success(localizeUi("ui.game.gamesurfacecomponent.value1RemovedFromTheNpcJournal", { value1: cleanGameNpcDisplayName(npcName) }));
+        toast.success(
+          localizeUi("ui.game.gamesurfacecomponent.value1RemovedFromTheNpcJournal", {
+            value1: cleanGameNpcDisplayName(npcName),
+          }),
+        );
       } catch (error) {
-        toast.error(error instanceof Error ? error.message :localizeUi("ui.game.gamesurfacecomponent.failedToRemoveValue1FromTheNpcJournal", { value1: npcName }));
+        toast.error(
+          error instanceof Error
+            ? error.message
+            : localizeUi("ui.game.gamesurfacecomponent.failedToRemoveValue1FromTheNpcJournal", { value1: npcName }),
+        );
         throw error;
       }
     },
@@ -7120,7 +7262,11 @@ function GameSurfaceComponent({
       const normalizedItemName = normalizeInventoryName(itemName);
       const updatedInventory = removeInventoryUnit(inventoryItems, normalizedItemName);
       if (updatedInventory === inventoryItems) {
-        toast.error(localizeUi("ui.game.gamesurfacecomponent.value1IsNoLongerInYourInventory", { value1: normalizedItemName || itemName }));
+        toast.error(
+          localizeUi("ui.game.gamesurfacecomponent.value1IsNoLongerInYourInventory", {
+            value1: normalizedItemName || itemName,
+          }),
+        );
         return;
       }
 
@@ -7188,7 +7334,9 @@ function GameSurfaceComponent({
 
       const renamedInventory = renameInventoryItem(inventoryItems, currentName, nextName);
       if (!renamedInventory) {
-        toast.error(localizeUi("ui.game.gamesurfacecomponent.value1IsNoLongerInYourInventory", { value1: currentName }));
+        toast.error(
+          localizeUi("ui.game.gamesurfacecomponent.value1IsNoLongerInYourInventory", { value1: currentName }),
+        );
         return null;
       }
 
@@ -7232,7 +7380,12 @@ function GameSurfaceComponent({
           });
         }
 
-        toast.success(localizeUi("ui.game.gamesurfacecomponent.renamedValue1ToValue2", { value1: currentName, value2: resolvedName }));
+        toast.success(
+          localizeUi("ui.game.gamesurfacecomponent.renamedValue1ToValue2", {
+            value1: currentName,
+            value2: resolvedName,
+          }),
+        );
         return resolvedName;
       } catch (error) {
         if (patchedGameState) {
@@ -7724,9 +7877,11 @@ function GameSurfaceComponent({
     async (member: { id: string; name: string; canRemove?: boolean }) => {
       if (!activeChatId || !member.canRemove) return;
       const confirmed = await showConfirmDialog({
-        title:localizeUi("ui.game.gamesurfacecomponent.removePartyMember"),
-        message:localizeUi("ui.game.gamesurfacecomponent.removeValue1FromTheActivePartyTheirGameCharacter", { value1: member.name }),
-        confirmLabel:localizeUi("settings.notifications.customSound.actions.remove"),
+        title: localizeUi("ui.game.gamesurfacecomponent.removePartyMember"),
+        message: localizeUi("ui.game.gamesurfacecomponent.removeValue1FromTheActivePartyTheirGameCharacter", {
+          value1: member.name,
+        }),
+        confirmLabel: localizeUi("settings.notifications.customSound.actions.remove"),
         cancelLabel: "Keep",
         tone: "destructive",
       });
@@ -7750,6 +7905,39 @@ function GameSurfaceComponent({
     (chatMeta.gameCombatStyle as GameCombatStyle | undefined) ??
     (combatSetupConfig?.combatStyle as GameCombatStyle | undefined) ??
     "classic";
+  const surfaceCombatSessionQuery = useActiveCombatSession(
+    activeChatId,
+    effectiveCombatStyle,
+    chatMeta.gameActiveState === "combat" && (!combatParty || !combatEnemies),
+  );
+  useEffect(() => {
+    const session = surfaceCombatSessionQuery.data?.session;
+    if (!session || combatParty || combatEnemies || chatMeta.gameActiveState !== "combat") return;
+    if (session.style === "classic") {
+      setCombatParty(session.canonicalState.party);
+      setCombatEnemies(session.canonicalState.enemies);
+      setInventoryItems(session.canonicalState.inventory ?? []);
+      setCombatItemEffects(session.canonicalState.itemEffects ?? []);
+      setCombatMechanics(session.canonicalState.mechanics ?? []);
+      setCombatDialogueCues(session.canonicalState.dialogueCues ?? []);
+      setCombatStartMessageId(session.canonicalState.startMessageId ?? null);
+    } else {
+      setCombatParty(
+        session.canonicalState.units
+          .filter((unit) => unit.side === "party")
+          .map((unit) => ({ ...unit, side: "player" as const })),
+      );
+      setCombatEnemies(
+        session.canonicalState.units
+          .filter((unit) => unit.side === "enemy")
+          .map((unit) => ({ ...unit, side: "enemy" as const })),
+      );
+      setInventoryItems(session.canonicalState.inventory ?? []);
+      setCombatItemEffects(session.canonicalState.itemEffects ?? []);
+    }
+    setCombatObjectives(session.objectives);
+    useGameModeStore.getState().setGameState("combat");
+  }, [chatMeta.gameActiveState, combatEnemies, combatParty, surfaceCombatSessionQuery.data?.session]);
   const tacticalCombatActive = combatUiActive && effectiveCombatStyle === "tactical";
   const topOverlayOffsetClass = "top-3";
   const queuedCombatMatchesLatest =
@@ -7780,9 +7968,10 @@ function GameSurfaceComponent({
   const hydrateGeneratedCombatState = useCallback(
     (combatState: CombatInitState): { party: Combatant[]; enemies: Combatant[] } | null => {
       const fallbackLevel = sessionNumber ?? 5;
+      const usedPartyIds = new Set<string>();
       const partyCombatants = Array.isArray(combatState.party)
         ? combatState.party.map((member, index) =>
-            generatedPartyMemberToCombatant(member, index, combatAvatarCandidates, fallbackLevel),
+            generatedPartyMemberToCombatant(member, index, combatAvatarCandidates, fallbackLevel, usedPartyIds),
           )
         : [];
       const enemyCombatants = Array.isArray(combatState.enemies)
@@ -7970,6 +8159,10 @@ function GameSurfaceComponent({
             party: combatants.party,
             enemies: combatants.enemies,
             itemEffects: Array.isArray(response.combatState.itemEffects) ? response.combatState.itemEffects : [],
+            objectives: generatedCombatObjectives(response.combatState.objectives, [
+              ...combatants.party,
+              ...combatants.enemies,
+            ]),
             mechanics: Array.isArray(response.combatState.mechanics) ? response.combatState.mechanics : [],
             dialogueCues: Array.isArray(response.combatState.dialogueCues) ? response.combatState.dialogueCues : [],
             environment: typeof response.combatState.environment === "string" ? response.combatState.environment : "",
@@ -7992,7 +8185,8 @@ function GameSurfaceComponent({
       gameBackgroundAutoGenerationEnabled,
       gameImageAutoGenerationEnabled,
       hydrateGeneratedCombatState,
-      requestAssetGeneration, localizeUi,
+      requestAssetGeneration,
+      localizeUi,
     ],
   );
 
@@ -8040,6 +8234,7 @@ function GameSurfaceComponent({
     setCombatParty(preparedCombatState.party);
     setCombatEnemies(preparedCombatState.enemies);
     setCombatItemEffects(preparedCombatState.itemEffects);
+    setCombatObjectives(preparedCombatState.objectives);
     setCombatMechanics(preparedCombatState.mechanics);
     setCombatDialogueCues(preparedCombatState.dialogueCues);
     setCombatSceneMeta({
@@ -8185,9 +8380,9 @@ function GameSurfaceComponent({
       return;
     }
     const confirmed = await showConfirmDialog({
-      title:localizeUi("ui.game.gamesurfacecomponent.startCombat"),
-      message:localizeUi("ui.game.gamesurfacecomponent.generateATacticalCombatEncounterFromTheCurrentGame"),
-      confirmLabel:localizeUi("ui.game.gamesurfacecomponent.yes"),
+      title: localizeUi("ui.game.gamesurfacecomponent.startCombat"),
+      message: localizeUi("ui.game.gamesurfacecomponent.generateATacticalCombatEncounterFromTheCurrentGame"),
+      confirmLabel: localizeUi("ui.game.gamesurfacecomponent.yes"),
       cancelLabel: "No",
     });
     if (!confirmed) return;
@@ -8725,7 +8920,11 @@ function GameSurfaceComponent({
         await updateChatMetadata.mutateAsync({ id: activeChatId, gameCharacterCards: updatedCards });
         toast.success(localizeUi("ui.game.gamesurfacecomponent.value1SheetUpdated", { value1: normalizedTitle }));
       } catch (error) {
-        toast.error(error instanceof Error ? error.message :localizeUi("ui.game.gamesurfacecomponent.failedToSaveCharacterSheet"));
+        toast.error(
+          error instanceof Error
+            ? error.message
+            : localizeUi("ui.game.gamesurfacecomponent.failedToSaveCharacterSheet"),
+        );
         throw error;
       }
     },
@@ -8753,28 +8952,15 @@ function GameSurfaceComponent({
         return;
       }
 
-      const formatCombatant = (combatant: Combatant) => {
-        const effects =
-          combatant.statusEffects && combatant.statusEffects.length > 0
-            ? `, effects: ${combatant.statusEffects.map((effect) => effect.name).join(", ")}`
-            : "";
-        const aura = combatant.elementAura ? `, aura: ${combatant.elementAura.element}` : "";
-        return `${combatant.name} ${combatant.hp}/${combatant.maxHp} HP${effects}${aura}`;
-      };
-      const partySnapshot = combatParty?.map(formatCombatant).join("; ") || "unknown";
-      const enemySnapshot = combatEnemies?.map(formatCombatant).join("; ") || "unknown";
-
       sendMessage(
         [
-          `I attempt a special combat maneuver: ${cleanInstruction}`,
+          cleanInstruction,
           ``,
-          `GM combat adjudication: Resolve this in your GM role using the current fiction and tactical state. If the maneuver creates a real combat condition, emit [status: target="Exact Name" effect="Effect Name" turns=1-3 stat="hp|attack|defense|speed" modifier="+/-N"]. If it applies an element, emit [element_attack: element="pyro|hydro|cryo|electro|anemo|geo|dendro|physical" target="Exact Name"]. Keep [state: combat] unless this action truly ends the fight.`,
-          ``,
-          `Current combat snapshot: Party: ${partySnapshot}. Enemies: ${enemySnapshot}.`,
+          `GM narration: The server has already adjudicated and applied this maneuver using the authoritative combat state. Narrate the listed result faithfully and briefly. Do not add, remove, or alter mechanical effects. Keep [state: combat] unless the authoritative result ended the fight.`,
         ].join("\n"),
       );
     },
-    [combatEnemies, combatParty, isStreaming, sendMessage, sessionInteractive, localizeUi],
+    [isStreaming, sendMessage, sessionInteractive, localizeUi],
   );
   const sessionSummaries = Array.isArray(chatMeta.gamePreviousSessionSummaries)
     ? (chatMeta.gamePreviousSessionSummaries as SessionSummary[])
@@ -8853,7 +9039,9 @@ function GameSurfaceComponent({
           id: activeChatId,
           gamePreviousSessionSummaries: updatedSummaries,
         });
-        toast.success(localizeUi("ui.game.gamesurfacecomponent.sessionValue1DetailsUpdated", { value1: sessionNumber }));
+        toast.success(
+          localizeUi("ui.game.gamesurfacecomponent.sessionValue1DetailsUpdated", { value1: sessionNumber }),
+        );
       } catch (error) {
         const message = error instanceof Error ? error.message : "Failed to update session details.";
         toast.error(message);
@@ -8946,7 +9134,7 @@ function GameSurfaceComponent({
         const response = await rollDice.mutateAsync({ chatId: activeChatId, notation });
         return response.result;
       } catch (err) {
-        toast.error(err instanceof Error ? err.message :localizeUi("ui.game.gamesurfacecomponent.failedToRollDice"));
+        toast.error(err instanceof Error ? err.message : localizeUi("ui.game.gamesurfacecomponent.failedToRollDice"));
         return null;
       }
     },
@@ -9050,7 +9238,9 @@ function GameSurfaceComponent({
         const definition = spatial.definition;
         if (!definition) return;
         if (!spatial.currentLocationId) {
-          toast.error(localizeUi("ui.game.gamesurfacecomponent.theCurrentStoryLocationIsUnavailableRepairTheHierarchy"));
+          toast.error(
+            localizeUi("ui.game.gamesurfacecomponent.theCurrentStoryLocationIsUnavailableRepairTheHierarchy"),
+          );
           setPendingMapMove(null);
           return;
         }
@@ -9095,7 +9285,8 @@ function GameSurfaceComponent({
       spatialContext.data,
       spatialContext.isLoading,
       viewedMap,
-      viewedMapIsActive, localizeUi,
+      viewedMapIsActive,
+      localizeUi,
     ],
   );
 
@@ -9177,7 +9368,8 @@ function GameSurfaceComponent({
       sendMessage,
       sessionInteractive,
       setDiceRollResult,
-      updateMessage, localizeUi,
+      updateMessage,
+      localizeUi,
     ],
   );
 
@@ -9188,6 +9380,7 @@ function GameSurfaceComponent({
     setQueuedCombatGeneration(null);
     setCombatGenerationPending(false);
     setCombatItemEffects([]);
+    setCombatObjectives([]);
     setCombatMechanics([]);
     setCombatDialogueCues([]);
   }, [activeChatId]);
@@ -9301,33 +9494,57 @@ function GameSurfaceComponent({
     setQueuedQte(null);
   }, []);
 
-  const handleReturnToPreCombatTurn = useCallback(() => {
+  const handleReturnToPreCombatTurn = useCallback(async () => {
     if (!latestAssistantMsg?.id) return;
-    const confirmed = window.confirm(localizeUi("ui.game.gamesurfacecomponent.exitCombatAndRemoveTheGmTurnThatStarted"),
+    const confirmed = window.confirm(
+      localizeUi("ui.game.gamesurfacecomponent.exitCombatAndRemoveTheGmTurnThatStarted"),
     );
     if (!confirmed) return;
+    if (combatAftermathPendingRef.current) return;
+    combatAftermathPendingRef.current = true;
+    const combatChatId = activeChatId;
 
-    setCombatParty(null);
-    setCombatEnemies(null);
-    setCombatSceneMeta(null);
-    setPendingEncounter(null);
-    setQueuedEncounter(null);
-    setQueuedCombatGeneration(null);
-    setCombatGenerationPending(false);
-    setCombatItemEffects([]);
-    setCombatMechanics([]);
-    setCombatDialogueCues([]);
-    setQueuedCombatStatuses(null);
-    setCombatStartMessageId(null);
-    appliedCombatStatusMessageIdsRef.current.clear();
-    appliedCombatElementMessageIdsRef.current.clear();
-    useGameModeStore.getState().setGameState("exploration");
-    if (activeChatId) {
-      transitionGameState.mutate({ chatId: activeChatId, newState: "exploration" });
-      clearCombatSnapshot(activeChatId);
+    if (combatChatId) {
+      try {
+        await api.post("/game/combat/session/abandon", { chatId: combatChatId });
+        await api.post("/game/state/transition", { chatId: combatChatId, newState: "exploration" });
+        await queryClient.invalidateQueries({ queryKey: chatKeys.detail(combatChatId) });
+      } catch (error) {
+        combatAftermathPendingRef.current = false;
+        toast.error(
+          error instanceof Error
+            ? error.message
+            : localizeUi("ui.game.gamesurfacecomponent.combatAftermathCouldNotBeSavedTryAgain"),
+        );
+        return;
+      }
+      try {
+        await clearCombatSnapshot(combatChatId);
+      } catch (error) {
+        console.warn("[game-surface] Previous-turn combat snapshot cleanup failed", error);
+      }
+    }
+
+    if (activeChatIdRef.current === combatChatId) {
+      setCombatParty(null);
+      setCombatEnemies(null);
+      setCombatSceneMeta(null);
+      setPendingEncounter(null);
+      setQueuedEncounter(null);
+      setQueuedCombatGeneration(null);
+      setCombatGenerationPending(false);
+      setCombatItemEffects([]);
+      setCombatObjectives([]);
+      setCombatMechanics([]);
+      setCombatDialogueCues([]);
+      setQueuedCombatStatuses(null);
+      setCombatStartMessageId(null);
+      appliedCombatStatusMessageIdsRef.current.clear();
+      appliedCombatElementMessageIdsRef.current.clear();
+      useGameModeStore.getState().setGameState("exploration");
     }
     onDeleteMessage(latestAssistantMsg.id);
-  }, [activeChatId, clearCombatSnapshot, latestAssistantMsg?.id, onDeleteMessage, transitionGameState, localizeUi]);
+  }, [activeChatId, clearCombatSnapshot, latestAssistantMsg?.id, onDeleteMessage, queryClient, localizeUi]);
 
   const handleCombatantsChange = useCallback((nextParty: Combatant[], nextEnemies: Combatant[]) => {
     setCombatParty(nextParty);
@@ -9336,29 +9553,245 @@ function GameSurfaceComponent({
 
   // Combat end handler — clear combat state and notify GM
   const handleCombatEnd = useCallback(
-    (outcome: "victory" | "defeat" | "flee", summary: CombatSummary) => {
-      setCombatParty(null);
-      setCombatEnemies(null);
-      setCombatSceneMeta(null);
-      setQueuedCombatGeneration(null);
-      setCombatGenerationPending(false);
-      setCombatItemEffects([]);
-      setCombatMechanics([]);
-      setCombatDialogueCues([]);
-      setQueuedCombatStatuses(null);
-      setCombatStartMessageId(null);
-      appliedCombatStatusMessageIdsRef.current.clear();
-      appliedCombatElementMessageIdsRef.current.clear();
+    async (outcome: "victory" | "defeat" | "flee", summary: CombatSummary) => {
+      if (combatAftermathPendingRef.current) return;
+      combatAftermathPendingRef.current = true;
+      const combatChatId = activeChatId;
+      const aftermathWrites: Promise<unknown>[] = [];
+      const playerCombatantId = combatParty?.find((member) => member.isPlayer)?.id ?? combatParty?.[0]?.id;
+      const playerResult =
+        (playerCombatantId ? summary.party.find((result) => result.id === playerCombatantId) : undefined) ??
+        summary.party[0];
+      const currentGameState = useGameStateStore.getState().current;
+      const currentPlayerStats = currentGameState?.playerStats;
+      const mergeCanonicalInventory = (
+        current: NonNullable<typeof currentPlayerStats>["inventory"],
+        canonical: NonNullable<CombatSummary["inventory"]>,
+      ) => {
+        const quantities = new Map(canonical.map((item) => [normalizeInventoryName(item.name), item.quantity]));
+        const seen = new Set<string>();
+        const merged = current.map((item) => {
+          const key = normalizeInventoryName(item.name);
+          const quantity = quantities.get(key);
+          if (quantity === undefined) return item;
+          seen.add(key);
+          return { ...item, quantity };
+        });
+        for (const item of canonical) {
+          const key = normalizeInventoryName(item.name);
+          if (!key || seen.has(key)) continue;
+          merged.push({ name: item.name, description: "", quantity: item.quantity, location: "on_person" });
+        }
+        return merged;
+      };
+      const combatResultById = new Map(summary.party.map((result) => [result.id, result] as const));
+      const combatResultsByName = new Map<string, CombatSummary["party"]>();
+      for (const result of summary.party) {
+        const key = normalizeTextForMatch(result.name);
+        if (key) combatResultsByName.set(key, [...(combatResultsByName.get(key) ?? []), result]);
+      }
+      const createPartyResultResolver = () => {
+        const usedIds = new Set<string>();
+        return (id: string | undefined, name: string | undefined) => {
+          const byId = id ? combatResultById.get(id) : undefined;
+          if (byId && !usedIds.has(byId.id)) {
+            usedIds.add(byId.id);
+            return byId;
+          }
+          const key = normalizeTextForMatch(name ?? "");
+          const namedResults = key ? combatResultsByName.get(key) : undefined;
+          const byName = namedResults?.length === 1 && !usedIds.has(namedResults[0].id) ? namedResults[0] : undefined;
+          if (byName) usedIds.add(byName.id);
+          return byName;
+        };
+      };
+      const updateStats = (
+        stats: Array<{ name: string; value: number; max: number; color: string }>,
+        result: CombatSummary["party"][number],
+      ) => {
+        const seen = new Set<string>();
+        const updated = stats.map((stat) => {
+          const key = normalizeTextForMatch(stat.name);
+          if (key === "hp" || key === "health" || key === "hit points") {
+            seen.add("hp");
+            return { ...stat, value: result.hp, max: result.maxHp };
+          }
+          if ((key === "mp" || key === "mana" || key === "magic points" || key === "energy") && result.mp != null) {
+            seen.add("mp");
+            return { ...stat, value: result.mp, max: result.maxMp ?? Math.max(stat.max, result.mp) };
+          }
+          return stat;
+        });
+        if (!seen.has("hp")) {
+          updated.push({ name: "HP", value: result.hp, max: result.maxHp, color: "#ef4444" });
+        }
+        if (!seen.has("mp") && result.mp != null) {
+          updated.push({
+            name: "MP",
+            value: result.mp,
+            max: result.maxMp ?? result.mp,
+            color: "#3b82f6",
+          });
+        }
+        return updated;
+      };
+      const combatStatus = (result: CombatSummary["party"][number]) => {
+        const statuses = [...result.statusEffects];
+        if (result.ko && !statuses.some((status) => /^(?:ko|knocked out)$/i.test(status.trim()))) {
+          statuses.push("KO");
+        }
+        return statuses.join(", ");
+      };
 
-      // Flip the server-side + local game state back to exploration immediately.
-      // (The [state: exploration] tag in the user message below is a hint for the GM's
-      // next turn, but doesn't itself flip the authoritative state.)
-      useGameModeStore.getState().setGameState("exploration");
-      if (activeChatId) {
-        transitionGameState.mutate({ chatId: activeChatId, newState: "exploration" });
-        // Clear the persisted combat snapshot so a future page refresh doesn't try to
-        // re-enter the fight that just ended.
-        clearCombatSnapshot(activeChatId);
+      if (combatChatId && currentGameState?.chatId === combatChatId) {
+        let nextPlayerStats =
+          currentPlayerStats && summary.inventory
+            ? {
+                ...currentPlayerStats,
+                inventory: mergeCanonicalInventory(currentPlayerStats.inventory, summary.inventory),
+              }
+            : currentPlayerStats;
+        if (playerResult && nextPlayerStats) {
+          const status = combatStatus(playerResult);
+          nextPlayerStats = {
+            ...nextPlayerStats,
+            stats: updateStats(nextPlayerStats.stats, playerResult),
+            status: status || nextPlayerStats.status,
+          };
+        }
+
+        let presentCharactersChanged = false;
+        const resolvePresentCharacterResult = createPartyResultResolver();
+        const nextPresentCharacters = currentGameState.presentCharacters.map((character) => {
+          const result = resolvePresentCharacterResult(character.characterId, character.name);
+          if (!result) return character;
+          presentCharactersChanged = true;
+          const status = combatStatus(result);
+          const customFields = { ...(character.customFields ?? {}) };
+          if (status) customFields["Combat Status"] = status;
+          else delete customFields["Combat Status"];
+          return {
+            ...character,
+            stats: updateStats(character.stats ?? [], result),
+            customFields,
+          };
+        });
+
+        if (nextPlayerStats !== currentPlayerStats || presentCharactersChanged) {
+          const gameStatePatch = {
+            ...(nextPlayerStats !== currentPlayerStats ? { playerStats: nextPlayerStats } : {}),
+            ...(presentCharactersChanged ? { presentCharacters: nextPresentCharacters } : {}),
+          };
+          useGameStateStore.getState().setGameState({ ...currentGameState, ...gameStatePatch });
+          aftermathWrites.push(api.patch(`/chats/${combatChatId}/game-state`, gameStatePatch));
+        }
+      }
+
+      if (combatChatId && Array.isArray(chatMeta.gameCharacterCards)) {
+        let cardsChanged = false;
+        const resolveCardResult = createPartyResultResolver();
+        const updatedCards = (chatMeta.gameCharacterCards as Array<Record<string, unknown>>).map((card) => {
+          const name = typeof card.name === "string" ? normalizeTextForMatch(card.name) : "";
+          const characterId = typeof card.characterId === "string" ? card.characterId : undefined;
+          const result = resolveCardResult(characterId, name);
+          if (!result) return card;
+          cardsChanged = true;
+
+          const currentRpgStats =
+            card.rpgStats && typeof card.rpgStats === "object" && !Array.isArray(card.rpgStats)
+              ? (card.rpgStats as Record<string, unknown>)
+              : {};
+          const currentPools = Array.isArray(currentRpgStats.pools)
+            ? (currentRpgStats.pools as Array<Record<string, unknown>>)
+            : [];
+          const seenPools = new Set<string>();
+          const pools = currentPools.map((pool) => {
+            const key = typeof pool.name === "string" ? normalizeTextForMatch(pool.name) : "";
+            if (key === "hp" || key === "health" || key === "hit points") {
+              seenPools.add("hp");
+              return { ...pool, value: result.hp, max: result.maxHp };
+            }
+            if ((key === "mp" || key === "mana" || key === "magic points" || key === "energy") && result.mp != null) {
+              seenPools.add("mp");
+              return { ...pool, value: result.mp, max: result.maxMp ?? Math.max(Number(pool.max) || 0, result.mp) };
+            }
+            return pool;
+          });
+          if (!seenPools.has("hp")) {
+            pools.push({ name: "HP", value: result.hp, max: result.maxHp, color: "#ef4444" });
+          }
+          if (!seenPools.has("mp") && result.mp != null) {
+            pools.push({
+              name: "MP",
+              value: result.mp,
+              max: Math.max(1, result.maxMp ?? result.mp),
+              color: "#3b82f6",
+            });
+          }
+
+          const extra =
+            card.extra && typeof card.extra === "object" && !Array.isArray(card.extra)
+              ? { ...(card.extra as Record<string, unknown>) }
+              : {};
+          const status = combatStatus(result);
+          if (status) extra["Combat Status"] = status;
+          else delete extra["Combat Status"];
+
+          return {
+            ...card,
+            extra,
+            rpgStats: {
+              ...currentRpgStats,
+              attributes: Array.isArray(currentRpgStats.attributes) ? currentRpgStats.attributes : [],
+              hp: { value: result.hp, max: result.maxHp },
+              pools,
+            },
+          };
+        });
+        if (cardsChanged) {
+          aftermathWrites.push(updateChatMetadata.mutateAsync({ id: combatChatId, gameCharacterCards: updatedCards }));
+        }
+      }
+      try {
+        await Promise.all(aftermathWrites);
+        if (combatChatId) {
+          if (summary.sessionId) {
+            await api.post(`/game/combat/session/${summary.sessionId}/complete`, { chatId: combatChatId });
+          }
+          await api.post("/game/state/transition", { chatId: combatChatId, newState: "exploration" });
+          await queryClient.invalidateQueries({ queryKey: chatKeys.detail(combatChatId) });
+        }
+      } catch (error) {
+        combatAftermathPendingRef.current = false;
+        toast.error(
+          error instanceof Error
+            ? error.message
+            : localizeUi("ui.game.gamesurfacecomponent.combatAftermathCouldNotBeSavedTryAgain"),
+        );
+        return;
+      }
+      if (combatChatId) {
+        try {
+          await clearCombatSnapshot(combatChatId);
+        } catch (error) {
+          console.warn("[game-surface] Completed combat snapshot cleanup failed", error);
+        }
+      }
+      if (activeChatIdRef.current === combatChatId) {
+        useGameModeStore.getState().setGameState("exploration");
+        setCombatParty(null);
+        setCombatEnemies(null);
+        setCombatSceneMeta(null);
+        setQueuedCombatGeneration(null);
+        setCombatGenerationPending(false);
+        setCombatItemEffects([]);
+        setCombatObjectives([]);
+        setCombatMechanics([]);
+        setCombatDialogueCues([]);
+        setQueuedCombatStatuses(null);
+        setCombatStartMessageId(null);
+        appliedCombatStatusMessageIdsRef.current.clear();
+        appliedCombatElementMessageIdsRef.current.clear();
       }
 
       // Build a compact, model-friendly recap so the GM can narrate the aftermath.
@@ -9383,6 +9816,11 @@ function GameSurfaceComponent({
 
       const recapLines: string[] = [];
       recapLines.push(`OUTCOME: ${outcome.toUpperCase()} (${roundsPhrase})`);
+      if (summary.objectives?.length) {
+        recapLines.push(
+          `Objectives: ${summary.objectives.map((objective) => `${objective.label} (${objective.status})`).join("; ")}`,
+        );
+      }
       if (defeatedEnemies.length > 0) recapLines.push(`Defeated: ${defeatedEnemies.join(", ")}`);
       if (survivingEnemies.length > 0) {
         recapLines.push(`Survived: ${survivingEnemies.map((e) => `${e.name} (${e.hp}/${e.maxHp} HP)`).join(", ")}`);
@@ -9414,13 +9852,18 @@ function GameSurfaceComponent({
       if (outcome === "victory") journalDescLines.push(`Victory (${roundsPhrase})`);
       else if (outcome === "defeat") journalDescLines.push(`The party was defeated (${roundsPhrase})`);
       else journalDescLines.push(`The party fled from battle (${roundsPhrase})`);
+      if (summary.objectives?.length) {
+        journalDescLines.push(
+          `Objectives: ${summary.objectives.map((objective) => `${objective.label} (${objective.status})`).join("; ")}`,
+        );
+      }
       if (defeatedEnemies.length > 0) journalDescLines.push(`Defeated: ${defeatedEnemies.join(", ")}`);
       journalDescLines.push(`Party status: ${partyStatus.join("; ")}`);
       if (lootText) journalDescLines.push(`Loot: ${lootText}`);
 
       api
         .post("/game/journal/entry", {
-          chatId: activeChatId,
+          chatId: combatChatId,
           type: "combat",
           data: {
             description: journalDescLines.join(" — "),
@@ -9429,7 +9872,16 @@ function GameSurfaceComponent({
         })
         .catch(() => {});
     },
-    [sendMessage, activeChatId, clearCombatSnapshot, transitionGameState],
+    [
+      sendMessage,
+      activeChatId,
+      combatParty,
+      chatMeta.gameCharacterCards,
+      clearCombatSnapshot,
+      localizeUi,
+      queryClient,
+      updateChatMetadata,
+    ],
   );
 
   // Toggle audio mute
@@ -9585,7 +10037,11 @@ function GameSurfaceComponent({
             toast.success(localizeUi("ui.game.gamesurfacecomponent.branchCreated"));
           },
           onError: (error) => {
-            toast.error(error instanceof Error ?localizeUi("ui.game.gamesurfacecomponent.branchFailedValue1", { value1: error.message }) :localizeUi("ui.game.gamesurfacecomponent.branchFailed"));
+            toast.error(
+              error instanceof Error
+                ? localizeUi("ui.game.gamesurfacecomponent.branchFailedValue1", { value1: error.message })
+                : localizeUi("ui.game.gamesurfacecomponent.branchFailed"),
+            );
           },
           onSettled: () => {
             toast.dismiss(branchToastId);
@@ -9689,7 +10145,8 @@ function GameSurfaceComponent({
     sceneAnalysis,
     sceneWrapCharacterNames,
     sceneAnalysisEnabled,
-    metaTime, localizeUi,
+    metaTime,
+    localizeUi,
   ]);
 
   // Remap legacy hud_bottom widgets to left/right (hud_bottom was removed)
@@ -10060,7 +10517,9 @@ function GameSurfaceComponent({
             <div className="flex w-full flex-shrink-0 flex-col items-center gap-4">
               <label className="flex w-full max-w-sm flex-col gap-1.5 text-left">
                 <span className="flex items-center gap-1.5 text-xs font-medium text-[var(--muted-foreground)] dark:text-white/50">
-                  <Plug size={12} />{localizeUi("ui.game.gamesurfacecomponent.gmPartyModel")}</span>
+                  <Plug size={12} />
+                  {localizeUi("ui.game.gamesurfacecomponent.gmPartyModel")}
+                </span>
                 <select
                   value={chat.connectionId ?? ""}
                   onChange={(e) => handleStartScreenConnectionChange(e.target.value)}
@@ -10072,7 +10531,9 @@ function GameSurfaceComponent({
                   {languageConnections.map((connection) => (
                     <option key={connection.id} value={connection.id}>
                       {connection.name}
-                      {connection.model ?localizeUi("ui.game.gamesetupwizard.value1", { value1: connection.model }) : ""}
+                      {connection.model
+                        ? localizeUi("ui.game.gamesetupwizard.value1", { value1: connection.model })
+                        : ""}
                     </option>
                   ))}
                 </select>
@@ -10095,11 +10556,15 @@ function GameSurfaceComponent({
                         audioManager.retryPending();
                       }}
                       className="group flex items-center gap-2 rounded-lg bg-zinc-900 px-6 py-3 text-sm font-semibold text-zinc-100 ring-1 ring-zinc-700/80 transition-all hover:scale-105 hover:bg-zinc-800 hover:shadow-lg hover:shadow-black/25"
-                    >{localizeUi("ui.noodle.wizardfooter.continue")}</button>
+                    >
+                      {localizeUi("ui.noodle.wizardfooter.continue")}
+                    </button>
                   ) : (
                     <>
                       {initialTurnFailed ? (
-                        <div className="max-w-sm text-sm text-[var(--muted-foreground)] dark:text-white/60">{localizeUi("ui.game.gamesurfacecomponent.gameGenerationFailedChooseAnotherGmPartyModelOr")}</div>
+                        <div className="max-w-sm text-sm text-[var(--muted-foreground)] dark:text-white/60">
+                          {localizeUi("ui.game.gamesurfacecomponent.gameGenerationFailedChooseAnotherGmPartyModelOr")}
+                        </div>
                       ) : (
                         <div className="flex items-center gap-3 text-sm text-[var(--muted-foreground)] dark:text-white/60">
                           <div className="h-5 w-5 animate-spin rounded-full border-2 border-[var(--muted)]/40 border-t-[var(--foreground)]/70 dark:border-white/20 dark:border-t-white/70" />
@@ -10119,8 +10584,12 @@ function GameSurfaceComponent({
                       {hasEverHadPlayableContent && !isStreaming && sceneAnalysisFailed && (
                         <div className="flex items-center gap-2">
                           <button onClick={() => retrySceneAnalysis()} className={SURFACE_BTN}>
-                            <RefreshCw size={14} />{localizeUi("ui.game.gamesurfacecomponent.retrySceneAnalysis")}</button>
-                          <button onClick={() => skipSceneAnalysis()} className={SURFACE_BTN}>{localizeUi("onboarding.actions.skip")}</button>
+                            <RefreshCw size={14} />
+                            {localizeUi("ui.game.gamesurfacecomponent.retrySceneAnalysis")}
+                          </button>
+                          <button onClick={() => skipSceneAnalysis()} className={SURFACE_BTN}>
+                            {localizeUi("onboarding.actions.skip")}
+                          </button>
                         </div>
                       )}
                       {/* Show skip only after stuck timeout — scene processing hung, not failed */}
@@ -10129,14 +10598,18 @@ function GameSurfaceComponent({
                         !sceneProcessed &&
                         sceneStuckVisible &&
                         !sceneAnalysisFailed && (
-                          <button onClick={() => skipSceneAnalysis()} className={cn("mt-1", SURFACE_BTN)}>{localizeUi("onboarding.actions.skip")}</button>
+                          <button onClick={() => skipSceneAnalysis()} className={cn("mt-1", SURFACE_BTN)}>
+                            {localizeUi("onboarding.actions.skip")}
+                          </button>
                         )}
                     </>
                   )}
                   {/* Show retry when generation stopped but no content arrived. */}
                   {!isStreaming && !hasEverHadPlayableContent && !startGame.isPending && (
                     <button onClick={generateInitialGameTurn} className={SURFACE_BTN}>
-                      <RefreshCw size={14} />{localizeUi("ui.game.gamesurfacecomponent.retry")}</button>
+                      <RefreshCw size={14} />
+                      {localizeUi("ui.game.gamesurfacecomponent.retry")}
+                    </button>
                   )}
                 </div>
               ) : (
@@ -10148,7 +10621,9 @@ function GameSurfaceComponent({
                   disabled={startGame.isPending || startGameRequested}
                   className="group flex items-center gap-2 rounded-lg bg-zinc-900 px-6 py-3 text-sm font-semibold text-zinc-100 ring-1 ring-zinc-700/80 transition-all hover:scale-105 hover:bg-zinc-800 hover:shadow-lg hover:shadow-black/25 disabled:opacity-50 disabled:hover:scale-100"
                 >
-                  <Play size={18} className="transition-transform group-hover:scale-110" />{localizeUi("ui.game.gamesurfacecomponent.startGame")}</button>
+                  <Play size={18} className="transition-transform group-hover:scale-110" />
+                  {localizeUi("ui.game.gamesurfacecomponent.startGame")}
+                </button>
               )}
             </div>
           </div>
@@ -10205,8 +10680,11 @@ function GameSurfaceComponent({
         <div className={cn(ROLEPLAY_POPOVER_HEADER, "flex items-start gap-3")}>
           <div className="min-w-0 flex-1">
             <div className={ROLEPLAY_POPOVER_TITLE}>
-              <Feather size="0.8rem" className="shrink-0 text-[var(--muted-foreground)]" />{localizeUi("game.toolbar.session")}</div>
-            <div className={ROLEPLAY_POPOVER_SUBTITLE}>{localizeUi("game.toolbar.session")} {displaySessionNumber} · {sessionStatus}
+              <Feather size="0.8rem" className="shrink-0 text-[var(--muted-foreground)]" />
+              {localizeUi("game.toolbar.session")}
+            </div>
+            <div className={ROLEPLAY_POPOVER_SUBTITLE}>
+              {localizeUi("game.toolbar.session")} {displaySessionNumber} · {sessionStatus}
             </div>
           </div>
           <div className="ml-auto flex shrink-0 items-center gap-1 pt-0.5">
@@ -10244,7 +10722,9 @@ function GameSurfaceComponent({
               )}
             >
               {tab === "history" ? <ScrollText size={12} /> : <BookOpen size={12} />}
-              {tab === "history" ?localizeUi("ui.game.gamesurfacecomponent.sessionHistory") :localizeUi("ui.game.gamesurfacecomponent.journal")}
+              {tab === "history"
+                ? localizeUi("ui.game.gamesurfacecomponent.sessionHistory")
+                : localizeUi("ui.game.gamesurfacecomponent.journal")}
             </button>
           ))}
         </div>
@@ -10401,7 +10881,7 @@ function GameSurfaceComponent({
                 <span className="truncate">{localizeUi("ui.game.gamesurfacecomponent.storyboard")}</span>
               </div>
               <span className="shrink-0 text-[0.625rem] text-white/45">
-                {frame ? formatStoryboardSectionLabel(frame) :localizeUi("ui.game.gamesurfacecomponent.rendering")}
+                {frame ? formatStoryboardSectionLabel(frame) : localizeUi("ui.game.gamesurfacecomponent.rendering")}
               </span>
             </div>
 
@@ -10436,7 +10916,7 @@ function GameSurfaceComponent({
                 {storyboardGenerating || latestTurnStoryboardRendering ? (
                   <Loader2 size={14} className="animate-spin" />
                 ) : null}
-                {frame ? frame.status.replace("_", " ") :localizeUi("ui.game.gamesurfacecomponent.creatingStoryboard")}
+                {frame ? frame.status.replace("_", " ") : localizeUi("ui.game.gamesurfacecomponent.creatingStoryboard")}
               </div>
             )}
 
@@ -10461,8 +10941,16 @@ function GameSurfaceComponent({
                         type="button"
                         onClick={handleStoryboardViewerPlaybackToggle}
                         className={STORYBOARD_VIEWER_CONTROL_BUTTON}
-                        title={storyboardViewerPlaying ?localizeUi("ui.game.gamesurfacecomponent.pauseStoryboardVideo") :localizeUi("ui.game.gamesurfacecomponent.playStoryboardVideo")}
-                        aria-label={storyboardViewerPlaying ?localizeUi("ui.game.gamesurfacecomponent.pauseStoryboardVideo") :localizeUi("ui.game.gamesurfacecomponent.playStoryboardVideo")}
+                        title={
+                          storyboardViewerPlaying
+                            ? localizeUi("ui.game.gamesurfacecomponent.pauseStoryboardVideo")
+                            : localizeUi("ui.game.gamesurfacecomponent.playStoryboardVideo")
+                        }
+                        aria-label={
+                          storyboardViewerPlaying
+                            ? localizeUi("ui.game.gamesurfacecomponent.pauseStoryboardVideo")
+                            : localizeUi("ui.game.gamesurfacecomponent.playStoryboardVideo")
+                        }
                       >
                         {storyboardViewerPlaying ? <Pause size={13} /> : <Play size={13} />}
                       </button>
@@ -10470,8 +10958,16 @@ function GameSurfaceComponent({
                         type="button"
                         onClick={() => setStoryboardViewerMuted((muted) => !muted)}
                         className={STORYBOARD_VIEWER_CONTROL_BUTTON}
-                        title={storyboardViewerMuted ?localizeUi("ui.game.gamesurfacecomponent.unmuteStoryboardVideo") :localizeUi("ui.game.gamesurfacecomponent.muteStoryboardVideo")}
-                        aria-label={storyboardViewerMuted ?localizeUi("ui.game.gamesurfacecomponent.unmuteStoryboardVideo") :localizeUi("ui.game.gamesurfacecomponent.muteStoryboardVideo")}
+                        title={
+                          storyboardViewerMuted
+                            ? localizeUi("ui.game.gamesurfacecomponent.unmuteStoryboardVideo")
+                            : localizeUi("ui.game.gamesurfacecomponent.muteStoryboardVideo")
+                        }
+                        aria-label={
+                          storyboardViewerMuted
+                            ? localizeUi("ui.game.gamesurfacecomponent.unmuteStoryboardVideo")
+                            : localizeUi("ui.game.gamesurfacecomponent.muteStoryboardVideo")
+                        }
                       >
                         {storyboardViewerMuted ? <VolumeX size={13} /> : <Volume2 size={13} />}
                       </button>
@@ -10489,8 +10985,12 @@ function GameSurfaceComponent({
                       })
                     }
                     className={STORYBOARD_VIEWER_CONTROL_BUTTON}
-                    title={localizeUi("ui.game.replaystoryboardmedia.changeStoryboardViewerSizeCurrentValue1", { value1: storyboardViewerSize })}
-                    aria-label={localizeUi("ui.game.replaystoryboardmedia.changeStoryboardViewerSizeCurrentValue1", { value1: storyboardViewerSize })}
+                    title={localizeUi("ui.game.replaystoryboardmedia.changeStoryboardViewerSizeCurrentValue1", {
+                      value1: storyboardViewerSize,
+                    })}
+                    aria-label={localizeUi("ui.game.replaystoryboardmedia.changeStoryboardViewerSizeCurrentValue1", {
+                      value1: storyboardViewerSize,
+                    })}
                   >
                     <Maximize2 size={13} />
                   </button>
@@ -10618,11 +11118,15 @@ function GameSurfaceComponent({
             className="marinara-chat-popover__item flex items-center gap-2 rounded-lg px-3 py-2 text-xs font-medium text-[var(--marinara-chat-chrome-panel-text)] transition-colors hover:bg-[var(--marinara-chat-chrome-highlight-bg-hover)] hover:text-[var(--marinara-chat-chrome-highlight-text)] disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent"
             title={
               gameStoryboardBackgroundVisualEnabled
-                ?localizeUi("ui.game.gamesurfacecomponent.storyboardBackgroundDisplayIsActiveSoSceneBackgroundGeneration")
-                :localizeUi("ui.game.gamesurfacecomponent.generateABackgroundForTheCurrentScene")
+                ? localizeUi(
+                    "ui.game.gamesurfacecomponent.storyboardBackgroundDisplayIsActiveSoSceneBackgroundGeneration",
+                  )
+                : localizeUi("ui.game.gamesurfacecomponent.generateABackgroundForTheCurrentScene")
             }
           >
-            {manualBackgroundGenerating ? <Loader2 size={14} className="animate-spin" /> : <ImagePlus size={14} />}{localizeUi("ui.game.gamesurfacecomponent.generateBackground")}</button>
+            {manualBackgroundGenerating ? <Loader2 size={14} className="animate-spin" /> : <ImagePlus size={14} />}
+            {localizeUi("ui.game.gamesurfacecomponent.generateBackground")}
+          </button>
           {gameSceneVideosEnabled && (
             <button
               type="button"
@@ -10674,7 +11178,7 @@ function GameSurfaceComponent({
                   </h3>
                   <p className="mt-0.5 text-[0.6875rem] uppercase tracking-wide text-[var(--marinara-chat-chrome-panel-muted)]">
                     {storyboardGenerating || latestTurnStoryboardRendering
-                      ?localizeUi("ui.characters.charactercallclipsgallery.generating")
+                      ? localizeUi("ui.characters.charactercallclipsgallery.generating")
                       : (latestTurnStoryboard?.status ?? "ready").replace("_", " ")}
                   </p>
                 </div>
@@ -10686,21 +11190,26 @@ function GameSurfaceComponent({
                       className="marinara-chat-popover__item flex items-center gap-1.5 rounded-md border border-[var(--marinara-chat-chrome-panel-divider)] px-2 py-1 text-[0.6875rem] font-medium text-[var(--marinara-chat-chrome-panel-text)] transition-colors hover:bg-[var(--marinara-chat-chrome-highlight-bg-hover)] hover:text-[var(--marinara-chat-chrome-highlight-text)]"
                       title={
                         gameStoryboardViewerDisplayMode === "background"
-                          ?localizeUi("ui.game.gamesurfacecomponent.showStoryboardBackground")
-                          :localizeUi("ui.game.gamesurfacecomponent.showTheFloatingStoryboardViewer")
+                          ? localizeUi("ui.game.gamesurfacecomponent.showStoryboardBackground")
+                          : localizeUi("ui.game.gamesurfacecomponent.showTheFloatingStoryboardViewer")
                       }
                     >
-                      <PanelsTopLeft size={12} />{localizeUi("ui.game.gamesurfacecomponent.showViewer")}</button>
+                      <PanelsTopLeft size={12} />
+                      {localizeUi("ui.game.gamesurfacecomponent.showViewer")}
+                    </button>
                   ) : null}
                   {latestTurnStoryboard?.turnNumber ? (
-                    <span className="rounded-md border border-[var(--marinara-chat-chrome-panel-divider)] px-2 py-1 text-[0.6875rem] text-[var(--marinara-chat-chrome-panel-muted)]">{localizeUi("ui.game.gamesurfacecomponent.turn")} {latestTurnStoryboard.turnNumber}
+                    <span className="rounded-md border border-[var(--marinara-chat-chrome-panel-divider)] px-2 py-1 text-[0.6875rem] text-[var(--marinara-chat-chrome-panel-muted)]">
+                      {localizeUi("ui.game.gamesurfacecomponent.turn")} {latestTurnStoryboard.turnNumber}
                     </span>
                   ) : null}
                 </div>
               </div>
               {storyboardGenerating && !latestTurnStoryboard ? (
                 <div className="flex items-center gap-2 rounded-lg border border-[var(--marinara-chat-chrome-panel-divider)] px-3 py-4 text-xs text-[var(--marinara-chat-chrome-panel-muted)]">
-                  <Loader2 size={14} className="animate-spin" />{localizeUi("ui.game.gamesurfacecomponent.creatingStoryboardKeyframes")}</div>
+                  <Loader2 size={14} className="animate-spin" />
+                  {localizeUi("ui.game.gamesurfacecomponent.creatingStoryboardKeyframes")}
+                </div>
               ) : null}
               {latestTurnStoryboard?.error ? (
                 <p className="mb-3 rounded-lg border border-[var(--marinara-chat-chrome-panel-divider)] px-3 py-2 text-[0.6875rem] text-[var(--destructive)]">
@@ -10721,7 +11230,9 @@ function GameSurfaceComponent({
                 />
               ) : null}
               {sceneVideoFailed && (
-                <p className="mt-2 text-[0.6875rem] text-[var(--destructive)]">{localizeUi("ui.game.gamesurfacecomponent.sceneVideoGenerationFailed")}</p>
+                <p className="mt-2 text-[0.6875rem] text-[var(--destructive)]">
+                  {localizeUi("ui.game.gamesurfacecomponent.sceneVideoGenerationFailed")}
+                </p>
               )}
             </div>
           )}
@@ -11396,12 +11907,20 @@ function GameSurfaceComponent({
                       <div className="flex items-start gap-3">
                         <AlertTriangle size={14} className="mt-0.5 shrink-0 text-amber-400" />
                         <div className="min-w-0 flex-1">
-                          <div className="text-xs font-medium text-amber-200">{localizeUi("ui.game.gamesurfacecomponent.localSceneHelperFailedToStart")}</div>
-                          <div className="mt-1 text-[0.6875rem] leading-relaxed text-white/70">{localizeUi("ui.game.gamesurfacecomponent.marinaraWillKeepTheGameRunningWithoutTheLocal")}{sidecarFailedRuntimeVariant &&
-                              ` Runtime: ${sidecarFailedRuntimeVariant.replace(/-/g, " ")}.`}
-                            {sidecarStartupError ?localizeUi("ui.game.gamesurfacecomponent.value1", { value1: sidecarStartupError }) : ""}
+                          <div className="text-xs font-medium text-amber-200">
+                            {localizeUi("ui.game.gamesurfacecomponent.localSceneHelperFailedToStart")}
                           </div>
-                          <div className="mt-1 text-[0.6875rem] leading-relaxed text-white/55">{localizeUi("ui.game.gamesurfacecomponent.openLocalAiModelToRetryStartupSwitchModels")}</div>
+                          <div className="mt-1 text-[0.6875rem] leading-relaxed text-white/70">
+                            {localizeUi("ui.game.gamesurfacecomponent.marinaraWillKeepTheGameRunningWithoutTheLocal")}
+                            {sidecarFailedRuntimeVariant &&
+                              ` Runtime: ${sidecarFailedRuntimeVariant.replace(/-/g, " ")}.`}
+                            {sidecarStartupError
+                              ? localizeUi("ui.game.gamesurfacecomponent.value1", { value1: sidecarStartupError })
+                              : ""}
+                          </div>
+                          <div className="mt-1 text-[0.6875rem] leading-relaxed text-white/55">
+                            {localizeUi("ui.game.gamesurfacecomponent.openLocalAiModelToRetryStartupSwitchModels")}
+                          </div>
                         </div>
                         <button
                           onClick={() => {
@@ -11409,7 +11928,9 @@ function GameSurfaceComponent({
                             openSidecarModal(true);
                           }}
                           className="rounded-lg bg-white/10 px-3 py-1.5 text-[0.6875rem] font-medium text-white/80 transition-colors hover:bg-white/20 hover:text-white"
-                        >{localizeUi("ui.game.gamesurfacecomponent.openLocalAiModel")}</button>
+                        >
+                          {localizeUi("ui.game.gamesurfacecomponent.openLocalAiModel")}
+                        </button>
                       </div>
                     </div>
                   </div>
@@ -11420,12 +11941,16 @@ function GameSurfaceComponent({
                   <div className="pointer-events-auto absolute bottom-32 left-1/2 z-30 -translate-x-1/2">
                     <div className="flex items-center gap-3 rounded-xl bg-black/80 px-4 py-2.5 shadow-lg backdrop-blur-sm">
                       <AlertTriangle size={14} className="shrink-0 text-amber-400" />
-                      <span className="text-xs text-white/70">{localizeUi("ui.game.gamesurfacecomponent.imageGenerationFailed")}</span>
+                      <span className="text-xs text-white/70">
+                        {localizeUi("ui.game.gamesurfacecomponent.imageGenerationFailed")}
+                      </span>
                       <button
                         onClick={() => retryAssetGeneration()}
                         className="flex items-center gap-1.5 rounded-lg bg-white/10 px-3 py-1.5 text-xs text-white/80 transition-colors hover:bg-white/20 hover:text-white"
                       >
-                        <RefreshCw size={12} />{localizeUi("ui.game.gamesurfacecomponent.retry")}</button>
+                        <RefreshCw size={12} />
+                        {localizeUi("ui.game.gamesurfacecomponent.retry")}
+                      </button>
                       <button
                         onClick={() => {
                           setAssetGenerationFailed(false);
@@ -11445,12 +11970,16 @@ function GameSurfaceComponent({
                   <div className="pointer-events-auto absolute bottom-32 left-1/2 z-30 -translate-x-1/2">
                     <div className="flex items-center gap-3 rounded-xl bg-black/80 px-4 py-2.5 shadow-lg backdrop-blur-sm">
                       <AlertTriangle size={14} className="shrink-0 text-amber-400" />
-                      <span className="text-xs text-white/70">{localizeUi("ui.game.gamesurfacecomponent.sceneAnalysisFailed")}</span>
+                      <span className="text-xs text-white/70">
+                        {localizeUi("ui.game.gamesurfacecomponent.sceneAnalysisFailed")}
+                      </span>
                       <button
                         onClick={() => retrySceneAnalysis()}
                         className="flex items-center gap-1.5 rounded-lg bg-white/10 px-3 py-1.5 text-xs text-white/80 transition-colors hover:bg-white/20 hover:text-white"
                       >
-                        <RefreshCw size={12} />{localizeUi("ui.game.gamesurfacecomponent.retry")}</button>
+                        <RefreshCw size={12} />
+                        {localizeUi("ui.game.gamesurfacecomponent.retry")}
+                      </button>
                       <button
                         onClick={() => setSceneAnalysisFailed(false)}
                         className="text-white/40 transition-colors hover:text-white/70"
@@ -11482,66 +12011,56 @@ function GameSurfaceComponent({
 
                   // Choice cards slot — rendered inside GameNarration above the narration box
                   const choicesSlot =
-                    activeChoices && narrationDone
-                      ? compactHudWidgets && !combatUiActive && hudWidgets.length > 0
-                        ? (
-                            <div
-                              data-component="GameSurface.MobileChoiceStage"
-                              className={cn(
-                                "pointer-events-auto mb-2 flex min-h-0 w-full shrink items-stretch gap-1.5 overflow-hidden",
-                                GAME_MOBILE_CHOICE_STAGE_HEIGHT,
-                              )}
-                            >
-                              <div
-                                data-component="GameSurface.MobileWidgetRailLeft"
-                                className="relative z-10 flex shrink-0 items-center"
-                              >
-                                <MobileWidgetPanel
-                                  widgets={normalizedWidgets}
-                                  position="hud_left"
-                                  chatId={activeChatId}
-                                />
-                              </div>
-                              <div
-                                data-component="GameSurface.MobileChoiceStack"
-                                className="flex min-h-0 min-w-0 flex-1 overflow-hidden"
-                              >
-                                <GameChoiceCards
-                                  choices={activeChoices}
-                                  onSelect={handleChoiceSelect}
-                                  onDismiss={handleDismissChoices}
-                                  disabled={isStreaming || !sessionInteractive}
-                                />
-                              </div>
-                              <div
-                                data-component="GameSurface.MobileWidgetRailRight"
-                                className="relative z-10 flex shrink-0 items-center"
-                              >
-                                <MobileWidgetPanel
-                                  widgets={normalizedWidgets}
-                                  position="hud_right"
-                                  chatId={activeChatId}
-                                />
-                              </div>
-                            </div>
-                          )
-                        : (
-                            <div
-                              data-component="GameSurface.MobileChoiceStack"
-                              className={cn(
-                                "pointer-events-auto mb-2 flex min-h-0 w-full shrink justify-center overflow-hidden md:max-h-[min(52dvh,32rem)]",
-                                GAME_MOBILE_CHOICE_STAGE_HEIGHT,
-                              )}
-                            >
-                              <GameChoiceCards
-                                choices={activeChoices}
-                                onSelect={handleChoiceSelect}
-                                onDismiss={handleDismissChoices}
-                                disabled={isStreaming || !sessionInteractive}
-                              />
-                            </div>
-                          )
-                      : undefined;
+                    activeChoices && narrationDone ? (
+                      compactHudWidgets && !combatUiActive && hudWidgets.length > 0 ? (
+                        <div
+                          data-component="GameSurface.MobileChoiceStage"
+                          className={cn(
+                            "pointer-events-auto mb-2 flex min-h-0 w-full shrink items-stretch gap-1.5 overflow-hidden",
+                            GAME_MOBILE_CHOICE_STAGE_HEIGHT,
+                          )}
+                        >
+                          <div
+                            data-component="GameSurface.MobileWidgetRailLeft"
+                            className="relative z-10 flex shrink-0 items-center"
+                          >
+                            <MobileWidgetPanel widgets={normalizedWidgets} position="hud_left" chatId={activeChatId} />
+                          </div>
+                          <div
+                            data-component="GameSurface.MobileChoiceStack"
+                            className="flex min-h-0 min-w-0 flex-1 overflow-hidden"
+                          >
+                            <GameChoiceCards
+                              choices={activeChoices}
+                              onSelect={handleChoiceSelect}
+                              onDismiss={handleDismissChoices}
+                              disabled={isStreaming || !sessionInteractive}
+                            />
+                          </div>
+                          <div
+                            data-component="GameSurface.MobileWidgetRailRight"
+                            className="relative z-10 flex shrink-0 items-center"
+                          >
+                            <MobileWidgetPanel widgets={normalizedWidgets} position="hud_right" chatId={activeChatId} />
+                          </div>
+                        </div>
+                      ) : (
+                        <div
+                          data-component="GameSurface.MobileChoiceStack"
+                          className={cn(
+                            "pointer-events-auto mb-2 flex min-h-0 w-full shrink justify-center overflow-hidden md:max-h-[min(52dvh,32rem)]",
+                            GAME_MOBILE_CHOICE_STAGE_HEIGHT,
+                          )}
+                        >
+                          <GameChoiceCards
+                            choices={activeChoices}
+                            onSelect={handleChoiceSelect}
+                            onDismiss={handleDismissChoices}
+                            disabled={isStreaming || !sessionInteractive}
+                          />
+                        </div>
+                      )
+                    ) : undefined;
 
                   const skillCheckSlot = pendingSkillCheck ? (
                     <GameSkillCheckResult result={pendingSkillCheck} onDismiss={() => setPendingSkillCheck(null)} />
@@ -11556,7 +12075,9 @@ function GameSurfaceComponent({
                       <Suspense
                         fallback={
                           <div className="flex h-full flex-1 items-center justify-center text-sm text-white/70">
-                            <Loader2 size={15} className="mr-2 animate-spin" />{localizeUi("ui.game.gamesurfacecomponent.loadingReplay")}</div>
+                            <Loader2 size={15} className="mr-2 animate-spin" />
+                            {localizeUi("ui.game.gamesurfacecomponent.loadingReplay")}
+                          </div>
                         }
                       >
                         <GameSessionReplay
@@ -11590,7 +12111,9 @@ function GameSurfaceComponent({
                           className="flex items-center gap-1.5 rounded-lg border border-white/15 bg-black/65 px-3 py-1.5 text-xs font-semibold text-white/80 shadow-lg backdrop-blur-md transition-colors hover:bg-black/80 hover:text-white"
                           title={localizeUi("ui.game.gamesurfacecomponent.openCombatLogs")}
                         >
-                          <ScrollText size={13} />{localizeUi("ui.game.gamesurfacecomponent.logs")}</button>
+                          <ScrollText size={13} />
+                          {localizeUi("ui.game.gamesurfacecomponent.logs")}
+                        </button>
                         <button
                           type="button"
                           onClick={handleReturnToPreCombatTurn}
@@ -11598,7 +12121,9 @@ function GameSurfaceComponent({
                           className="flex items-center gap-1.5 rounded-lg border border-amber-300/25 bg-amber-500/20 px-3 py-1.5 text-xs font-semibold text-amber-100 shadow-lg backdrop-blur-md transition-colors hover:bg-amber-500/30 disabled:opacity-50"
                           title={localizeUi("ui.game.gamesurfacecomponent.exitCombatAndRemoveTheTurnThatStartedIt")}
                         >
-                          <RotateCcw size={13} />{localizeUi("ui.game.gamesurfacecomponent.previousTurn")}</button>
+                          <RotateCcw size={13} />
+                          {localizeUi("ui.game.gamesurfacecomponent.previousTurn")}
+                        </button>
                       </>
                     );
 
@@ -11606,11 +12131,14 @@ function GameSurfaceComponent({
                       <div className="relative h-full min-h-0">
                         <Suspense
                           fallback={
-                            <div className="flex h-full items-center justify-center text-sm text-white/70">{localizeUi("ui.game.gamesurfacecomponent.loadingCombat")}</div>
+                            <div className="flex h-full items-center justify-center text-sm text-white/70">
+                              {localizeUi("ui.game.gamesurfacecomponent.loadingCombat")}
+                            </div>
                           }
                         >
                           {effectiveCombatStyle === "tactical" ? (
                             <TacticalCombatUI
+                              key={`${activeChatId}:tactical`}
                               chatId={activeChatId}
                               party={combatParty}
                               enemies={combatEnemies}
@@ -11620,27 +12148,39 @@ function GameSurfaceComponent({
                               }
                               environment={combatSceneMeta?.environmentType ?? null}
                               formation={combatSceneMeta?.formation ?? null}
-                              playerCombatantId={combatParty[0]?.id ?? null}
+                              inventoryItems={inventoryItems}
+                              combatItemEffects={combatItemEffects}
+                              combatObjectives={combatObjectives}
+                              combatMechanics={combatMechanics}
+                              onInventoryItemUsed={handleUseCombatInventoryItem}
+                              onInventoryChange={setInventoryItems}
+                              playerCombatantId={
+                                combatParty.find((member) => member.isPlayer)?.id ?? combatParty[0]?.id ?? null
+                              }
                               onCombatEnd={handleCombatEnd}
                               onCustomInstruction={handleCombatCustomInstruction}
                             />
                           ) : (
                             <GameCombatUI
+                              key={`${activeChatId}:classic`}
                               chatId={activeChatId}
                               party={combatParty}
                               enemies={combatEnemies}
                               inventoryItems={inventoryItems}
                               onCombatEnd={handleCombatEnd}
                               onInventoryItemUsed={handleUseCombatInventoryItem}
+                              onInventoryChange={setInventoryItems}
                               onCombatantsChange={handleCombatantsChange}
                               onOpenInventory={() => setInventoryOpen(true)}
                               onCustomInstruction={handleCombatCustomInstruction}
                               onSpriteSuggestionChange={setCombatSpriteSuggestion}
                               isStreaming={isStreaming}
+                              restoreSession={Boolean(chatMeta.gameCombatState)}
                               narration="Battle starts."
                               combatDialogue={combatDialogueLines}
                               combatDialogueCues={combatDialogueCues}
                               combatItemEffects={combatItemEffects}
+                              combatObjectives={combatObjectives}
                               combatMechanics={combatMechanics}
                               voicedCombatSpeakerNames={voicedCombatSpeakerNames}
                               gameVoiceVolume={effectiveGameVoiceVolume}
@@ -11859,7 +12399,9 @@ function GameSurfaceComponent({
                       <div className="flex items-center justify-between border-b border-white/10 px-4 py-3">
                         <div className="flex items-center gap-2">
                           <ScrollText size={16} className="text-[var(--muted-foreground)]" />
-                          <span className="text-sm font-semibold text-[var(--foreground)]">{localizeUi("ui.game.gamesurfacecomponent.combatLogs")}</span>
+                          <span className="text-sm font-semibold text-[var(--foreground)]">
+                            {localizeUi("ui.game.gamesurfacecomponent.combatLogs")}
+                          </span>
                         </div>
                         <button
                           type="button"
@@ -11882,7 +12424,9 @@ function GameSurfaceComponent({
                         }}
                       >
                         {combatLogEntries.length === 0 ? (
-                          <p className="text-sm text-[var(--muted-foreground)]">{localizeUi("ui.game.gamesurfacecomponent.noLogsYet")}</p>
+                          <p className="text-sm text-[var(--muted-foreground)]">
+                            {localizeUi("ui.game.gamesurfacecomponent.noLogsYet")}
+                          </p>
                         ) : (
                           <>
                             {hiddenCombatLogCount > 0 && (
@@ -11896,7 +12440,9 @@ function GameSurfaceComponent({
                                     );
                                   }}
                                   className="rounded-full border border-white/10 bg-black/55 px-3 py-1.5 text-xs font-medium text-white/70 shadow-lg transition-colors hover:bg-white/10 hover:text-white"
-                                >{localizeUi("ui.game.gamesurfacecomponent.showMoreOlderLogs")}{hiddenCombatLogCount})
+                                >
+                                  {localizeUi("ui.game.gamesurfacecomponent.showMoreOlderLogs")}
+                                  {hiddenCombatLogCount})
                                 </button>
                               </div>
                             )}
@@ -12065,20 +12611,29 @@ function GameSurfaceComponent({
 
       {imagePromptReviewModal}
 
-      <Modal open={interruptModalOpen} onClose={closeInterruptModal} title={localizeUi("ui.game.gamesurfacecomponent.attemptToInterrupt")} width="max-w-md">
+      <Modal
+        open={interruptModalOpen}
+        onClose={closeInterruptModal}
+        title={localizeUi("ui.game.gamesurfacecomponent.attemptToInterrupt")}
+        width="max-w-md"
+      >
         <div className="flex flex-col gap-4">
           <div className="flex items-start gap-3">
             <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-red-500/15">
               <AlertTriangle size="1.125rem" className="text-red-300" />
             </div>
-            <p className="text-sm text-[var(--muted-foreground)]">{localizeUi("ui.game.gamesurfacecomponent.interruptionAttemptsCanGoBadlyDependingOnTheSituation")}</p>
+            <p className="text-sm text-[var(--muted-foreground)]">
+              {localizeUi("ui.game.gamesurfacecomponent.interruptionAttemptsCanGoBadlyDependingOnTheSituation")}
+            </p>
           </div>
 
           <div className="flex flex-wrap items-center justify-end gap-2">
             <button
               onClick={closeInterruptModal}
               className="rounded-lg bg-zinc-950/80 px-3 py-1.5 text-xs font-medium text-[var(--muted-foreground)] ring-1 ring-zinc-700/80 transition-colors hover:bg-zinc-800/80 hover:text-[var(--foreground)]"
-            >{localizeUi("ui.game.gamesurfacecomponent.no")}</button>
+            >
+              {localizeUi("ui.game.gamesurfacecomponent.no")}
+            </button>
             <button
               onClick={() => confirmInterrupt("force")}
               className="rounded-lg px-3 py-1.5 text-xs font-semibold ring-1 transition-colors"
@@ -12089,12 +12644,16 @@ function GameSurfaceComponent({
                 boxShadow: "0 0 0 1px rgba(32, 194, 14, 0.35) inset",
               }}
               title={localizeUi("ui.game.gamesurfacecomponent.cutInWithoutTellingTheGmItWasAn")}
-            >{localizeUi("ui.game.gamesurfacecomponent.forceInterrupt")}</button>
+            >
+              {localizeUi("ui.game.gamesurfacecomponent.forceInterrupt")}
+            </button>
             <button
               onClick={() => confirmInterrupt("risky")}
               className="rounded-lg bg-red-500/20 px-3 py-1.5 text-xs font-semibold text-red-200 ring-1 ring-red-500/40 transition-colors hover:bg-red-500/30"
               title={localizeUi("ui.game.gamesurfacecomponent.attemptAnInFictionInterruptionOutcomesCanFail")}
-            >{localizeUi("ui.game.gamesurfacecomponent.yes")}</button>
+            >
+              {localizeUi("ui.game.gamesurfacecomponent.yes")}
+            </button>
           </div>
         </div>
       </Modal>
@@ -12102,7 +12661,11 @@ function GameSurfaceComponent({
       <Modal
         open={confirmEndSessionOpen}
         onClose={handleCloseEndSessionDialog}
-        title={concludeSession.isPending ?localizeUi("ui.game.gamesurfacecomponent.endingSession") :localizeUi("ui.game.gamesurfacecomponent.endSession")}
+        title={
+          concludeSession.isPending
+            ? localizeUi("ui.game.gamesurfacecomponent.endingSession")
+            : localizeUi("ui.game.gamesurfacecomponent.endSession")
+        }
         width="max-w-md"
       >
         <div className="flex flex-col gap-4">
@@ -12112,8 +12675,8 @@ function GameSurfaceComponent({
             </div>
             <p className="text-sm text-[var(--muted-foreground)]">
               {concludeSession.isPending
-                ?localizeUi("ui.game.gamesurfacecomponent.endingThisSessionAndGeneratingItsSummaryPleaseWait")
-                :localizeUi("ui.game.gamesurfacecomponent.areYouSureYouWantToEndThisSession")}
+                ? localizeUi("ui.game.gamesurfacecomponent.endingThisSessionAndGeneratingItsSummaryPleaseWait")
+                : localizeUi("ui.game.gamesurfacecomponent.areYouSureYouWantToEndThisSession")}
             </p>
           </div>
 
@@ -12125,7 +12688,9 @@ function GameSurfaceComponent({
 
           {!concludeSession.isPending && (
             <label className="flex flex-col gap-1.5">
-              <span className="text-xs font-medium text-[var(--foreground)]">{localizeUi("ui.game.gamesurfacecomponent.whatDoYouWantToHappenInTheNext")}</span>
+              <span className="text-xs font-medium text-[var(--foreground)]">
+                {localizeUi("ui.game.gamesurfacecomponent.whatDoYouWantToHappenInTheNext")}
+              </span>
               <textarea
                 value={nextSessionRequest}
                 onChange={(event) => setNextSessionRequest(event.target.value)}
@@ -12142,13 +12707,17 @@ function GameSurfaceComponent({
               onClick={handleCloseEndSessionDialog}
               disabled={concludeSession.isPending}
               className="rounded-lg bg-zinc-950/80 px-3 py-1.5 text-xs font-medium text-[var(--muted-foreground)] ring-1 ring-zinc-700/80 transition-colors hover:bg-zinc-800/80 hover:text-[var(--foreground)] disabled:cursor-not-allowed disabled:opacity-50"
-            >{localizeUi("chat.delete.dialog.cancel")}</button>
+            >
+              {localizeUi("chat.delete.dialog.cancel")}
+            </button>
             <button
               onClick={handleConfirmEndSession}
               disabled={concludeSession.isPending}
               className="rounded-lg bg-[var(--destructive)]/15 px-3 py-1.5 text-xs font-medium text-[var(--destructive)] ring-1 ring-[var(--destructive)]/25 transition-colors hover:bg-[var(--destructive)]/25 disabled:opacity-50"
             >
-              {concludeSession.isPending ?localizeUi("ui.game.gamesurfacecomponent.endingSession_06ef62f") :localizeUi("ui.game.gamesurfacecomponent.endSession")}
+              {concludeSession.isPending
+                ? localizeUi("ui.game.gamesurfacecomponent.endingSession_06ef62f")
+                : localizeUi("ui.game.gamesurfacecomponent.endSession")}
             </button>
           </div>
         </div>

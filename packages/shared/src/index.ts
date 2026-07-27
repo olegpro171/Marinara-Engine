@@ -13,6 +13,7 @@ export * from "./types/connection.js";
 export * from "./types/agent.js";
 export * from "./types/game-state.js";
 export * from "./types/combat-encounter.js";
+export * from "./types/combat-session.js";
 export * from "./types/scene.js";
 export * from "./types/persona.js";
 export * from "./types/regex.js";
@@ -82,10 +83,7 @@ export * from "./constants/docs-languages.js";
 
 // Feature registries
 export * from "./features/agents/agent-manifest.types.js";
-export {
-  BUILT_IN_AGENT_MANIFESTS,
-  isBuiltInAgentRuntimeDisabled,
-} from "./features/agents/agent-registry.js";
+export { BUILT_IN_AGENT_MANIFESTS, isBuiltInAgentRuntimeDisabled } from "./features/agents/agent-registry.js";
 export * from "./features/function-calls/tool-definitions.js";
 export * from "./features/folder-packages/manifest-package.js";
 
