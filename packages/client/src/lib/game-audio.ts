@@ -87,6 +87,8 @@ class GameAudioManager {
   private sfxPool: HTMLAudioElement[] = [];
   private sfxIndex = 0;
   private sfxAudioContext: AudioContext | null = null;
+  private audioSources = new Set<AudioScheduledSourceNode>();
+  private oneShotLayers = new Set<OneShotAudioLayer>();
   private proceduralSfxTimers = new Set<ReturnType<typeof setTimeout>>();
   private sfxGeneration = 0;
   private mediaUnlockElement: HTMLAudioElement | null = null;
@@ -123,7 +125,9 @@ class GameAudioManager {
     if (this.interactionListenerAttached) return;
     this.interactionListenerAttached = true;
     const handler = () => {
-      this.unlock();
+      // This singleton is also imported by Conversation and Roleplay. An
+      // ordinary navigation click must not start a silent Game audio engine.
+      this.userHasInteracted = true;
       document.removeEventListener("click", handler, true);
       document.removeEventListener("touchstart", handler, true);
       document.removeEventListener("keydown", handler, true);
@@ -198,9 +202,8 @@ class GameAudioManager {
       if (!AudioContextCtor) return null;
       this.sfxAudioContext = new AudioContextCtor();
     }
-    if (this.sfxAudioContext.state === "suspended") {
-      void this.sfxAudioContext.resume().catch(() => {});
-    }
+    // A quick return to Game can race the previous dispose's pending suspend.
+    void this.sfxAudioContext.resume().catch(() => {});
     return this.sfxAudioContext;
   }
 
@@ -213,6 +216,11 @@ class GameAudioManager {
     await ctx.resume().catch(() => undefined);
     this.audioContextUnlocked = (ctx.state as string) === "running";
     return this.audioContextUnlocked;
+  }
+
+  private trackAudioSource(source: AudioScheduledSourceNode): void {
+    this.audioSources.add(source);
+    source.addEventListener("ended", () => this.audioSources.delete(source), { once: true });
   }
 
   private primeMediaElement(): void {
@@ -256,6 +264,7 @@ class GameAudioManager {
       const source = ctx.createBufferSource();
       source.buffer = ctx.createBuffer(1, 1, ctx.sampleRate);
       source.connect(ctx.destination);
+      this.trackAudioSource(source);
       source.start(0);
       if (ctx.state === "running") {
         this.audioContextUnlocked = true;
@@ -279,7 +288,8 @@ class GameAudioManager {
     const existing = this.mediaNodes.get(audio);
     if (existing) return existing.gain;
 
-    const ctx = this.getSfxAudioContext();
+    // Volume changes must neither create nor resume an idle audio context.
+    const ctx = this.sfxAudioContext;
     if (!ctx || ctx.state !== "running") return null;
 
     try {
@@ -350,6 +360,7 @@ class GameAudioManager {
         if (!(await this.resumeAudioContext(ctx))) {
           throw new Error("Audio context is not running");
         }
+        if (stopped) return;
 
         const nextSource = ctx.createBufferSource();
         const nextGain = ctx.createGain();
@@ -360,6 +371,7 @@ class GameAudioManager {
         source = nextSource;
         gain = nextGain;
         applyVolume();
+        this.trackAudioSource(nextSource);
         nextSource.start();
       } catch {
         if (stopped) return;
@@ -437,6 +449,7 @@ class GameAudioManager {
         releaseAudio(fallbackAudio);
         fallbackAudio = null;
       }
+      this.oneShotLayers.delete(layer);
     };
 
     const finish = () => {
@@ -484,6 +497,7 @@ class GameAudioManager {
         if (!(await this.resumeAudioContext(ctx))) {
           throw new Error("Audio context is not running");
         }
+        if (stopped) return;
 
         const nextSource = ctx.createBufferSource();
         const nextGain = ctx.createGain();
@@ -494,6 +508,7 @@ class GameAudioManager {
         source = nextSource;
         gain = nextGain;
         applyVolume();
+        this.trackAudioSource(nextSource);
         nextSource.start();
         markStarted();
       } catch {
@@ -504,7 +519,7 @@ class GameAudioManager {
       fail();
     });
 
-    return {
+    const layer: OneShotAudioLayer = {
       ready,
       setVolume: (nextVolume: number) => {
         currentVolume = clampUnit(nextVolume);
@@ -527,6 +542,8 @@ class GameAudioManager {
         cleanup();
       },
     };
+    this.oneShotLayers.add(layer);
+    return layer;
   }
 
   private playTone(
@@ -549,6 +566,7 @@ class GameAudioManager {
     gain.gain.exponentialRampToValueAtTime(0.0001, now + duration);
     osc.connect(gain);
     gain.connect(ctx.destination);
+    this.trackAudioSource(osc);
     osc.start(now);
     osc.stop(now + duration + 0.02);
   }
@@ -580,6 +598,7 @@ class GameAudioManager {
     source.connect(filter);
     filter.connect(gain);
     gain.connect(ctx.destination);
+    this.trackAudioSource(source);
     source.start(now);
   }
 
@@ -795,6 +814,7 @@ class GameAudioManager {
   /** Play a sound effect once or repeat it sequentially for a scene beat. */
   playSfx(tag: string, manifest?: AssetMap | null, loopCount = 1): void {
     if (this.isMuted || this.sfxVolume <= 0 || !this.userHasInteracted) return;
+    this.getSfxAudioContext();
     const generation = this.sfxGeneration;
     const url = this.resolveAssetUrl(tag, manifest);
     const audio = this.sfxPool[this.sfxIndex % SFX_POOL_SIZE]!;
@@ -960,6 +980,7 @@ class GameAudioManager {
     this.sfxGeneration += 1;
     this.stopMusic(true);
     this.stopAmbient();
+    for (const layer of this.oneShotLayers) layer.stop();
     for (const timer of this.proceduralSfxTimers) clearTimeout(timer);
     this.proceduralSfxTimers.clear();
     for (const el of this.sfxPool) {
@@ -967,6 +988,19 @@ class GameAudioManager {
       el.onended = null;
       releaseAudio(el);
     }
+    for (const source of this.audioSources) {
+      source.onended = null;
+      try {
+        source.stop();
+      } catch {
+        // A source may already have stopped before its ended event arrives.
+      }
+      source.disconnect();
+    }
+    this.audioSources.clear();
+    // Keep the unlocked context reusable, but release Safari's audio thread
+    // while the user reads another chat or returns to Home.
+    void this.sfxAudioContext?.suspend().catch(() => {});
   }
 
   /** Get current playback state. */

@@ -159,6 +159,14 @@ for (const mode of ["conversation", "roleplay", "game"] as const) {
               state = "running";
               currentTime = 0;
               destination = {};
+              resume() {
+                this.state = "running";
+                return Promise.resolve();
+              }
+              suspend() {
+                this.state = "suspended";
+                return Promise.resolve();
+              }
               createGain() {
                 return { gain: { setValueAtTime() {}, exponentialRampToValueAtTime() {} }, connect() {} };
               }

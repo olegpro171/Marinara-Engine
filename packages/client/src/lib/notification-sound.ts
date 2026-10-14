@@ -3,6 +3,7 @@
 // ──────────────────────────────────────────────
 
 let audioCtx: AudioContext | null = null;
+let activePings = 0;
 let customNotificationSoundUrl: string | null = null;
 
 type NotificationPingOptions = {
@@ -26,7 +27,8 @@ function getAudioContext(): AudioContext | null {
     if (!AudioContextCtor) return null;
     audioCtx = new AudioContextCtor();
   }
-  if (audioCtx.state === "suspended") void audioCtx.resume().catch(() => {});
+  // Resume even if a previous ping's suspend request is still pending.
+  void audioCtx.resume().catch(() => {});
   return audioCtx;
 }
 
@@ -62,6 +64,17 @@ function playSynthesizedNotificationPing(): void {
 
   osc1.connect(gain1).connect(ctx.destination);
   osc2.connect(gain2).connect(ctx.destination);
+
+  activePings += 1;
+  osc1.onended = () => {
+    osc1.disconnect();
+    osc2.disconnect();
+    gain1.disconnect();
+    gain2.disconnect();
+    activePings -= 1;
+    // A running, silent context keeps Safari's audio rendering thread awake.
+    if (activePings === 0) void ctx.suspend().catch(() => {});
+  };
 
   osc1.start(now);
   osc1.stop(now + 0.25);
